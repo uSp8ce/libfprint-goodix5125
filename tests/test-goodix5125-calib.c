@@ -447,11 +447,35 @@ test_template_rejects_bad_data (void)
   g_assert_false (g5125_template_from_variant (empty, &out, &len));
 }
 
+static void
+test_templates_variant (void)
+{
+  const guint8 a[] = { 1, 2, 3 }, b[] = { 9, 8, 7, 6, 5 };
+  const guint8 *in[] = { a, b };
+  const gsize inlen[] = { sizeof a, sizeof b };
+  const guint8 *out[G5125_MAX_TEMPLATES];
+  gsize outlen[G5125_MAX_TEMPLATES];
+  g_autoptr(GVariant) multi = g_variant_ref_sink (g5125_templates_to_variant (in, inlen, 2));
+  g_autoptr(GVariant) single = g_variant_ref_sink (g5125_template_to_variant (b, sizeof b));
+  g_autoptr(GVariant) wrong = g_variant_ref_sink (g_variant_new ("(y@aay)", 9,
+                                                   g_variant_new_array (G_VARIANT_TYPE ("ay"), NULL, 0)));
+
+  g_assert_cmpuint (g5125_templates_from_variant (multi, out, outlen, G5125_MAX_TEMPLATES), ==, 2);
+  g_assert_cmpmem (out[0], outlen[0], a, sizeof a);
+  g_assert_cmpmem (out[1], outlen[1], b, sizeof b);
+  g_assert_cmpuint (g5125_templates_from_variant (multi, out, outlen, 1), ==, 1);
+  g_assert_cmpuint (g5125_templates_from_variant (single, out, outlen, G5125_MAX_TEMPLATES), ==, 1);
+  g_assert_cmpmem (out[0], outlen[0], b, sizeof b);
+  g_assert_cmpuint (g5125_templates_from_variant (wrong, out, outlen, G5125_MAX_TEMPLATES), ==, 0);
+  g_assert_cmpuint (g5125_templates_from_variant (NULL, out, outlen, G5125_MAX_TEMPLATES), ==, 0);
+}
+
 int
 main (int argc, char *argv[])
 {
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/goodix5125/image/native-crc", test_decode_native_image);
+  g_test_add_func ("/goodix5125/templates-variant", test_templates_variant);
   g_test_add_func ("/goodix5125/config/native", test_native_config);
   g_test_add_func ("/goodix5125/otp/check-ok", test_otp_check_ok);
   g_test_add_func ("/goodix5125/otp/check-corrupt", test_otp_check_detects_corruption);

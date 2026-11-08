@@ -61,7 +61,46 @@ struct _FpiDeviceGoodixTls5125
   FpiMatchResult     result;
   FpPrint           *identified;
   GError            *result_error;
+
+  /* frames read for the current touch, and how many passed preprocessing */
+  guint              burst_idx;
+  guint              frames_ok;
+  gint               best_score;
 };
+
+/* Frames read per touch for verify/identify. GOODIX5125_BURST overrides. */
+#define G5125_BURST_DEFAULT 3
+
+static guint
+g5125_burst_frames (void)
+{
+  const char *s = g_getenv ("GOODIX5125_BURST");
+  gint n = s ? atoi (s) : G5125_BURST_DEFAULT;
+
+  return CLAMP (n, 1, 5);
+}
+
+/* Debug capture: GOODIX5125_CAPTURE_DIR=<dir> saves every decoded frame as
+ * t<touch>-f<frame>.raw (5120 little-endian u16, wire order). */
+static void
+g5125_capture_frame (const guint16 pix[G5125_PIXELS], guint frame)
+{
+  static guint touch;
+  const char *dir = g_getenv ("GOODIX5125_CAPTURE_DIR");
+  g_autofree gchar *path = NULL;
+  g_autoptr(GError) err = NULL;
+
+  if (!dir || !*dir)
+    return;
+  if (frame == 0)
+    touch++;
+  path = g_strdup_printf ("%s/t%03u-f%u.raw", dir, touch, frame);
+  if (!g_file_set_contents_full (path, (const gchar *) pix, G5125_PIXELS * 2,
+                                 G_FILE_SET_CONTENTS_NONE, 0600, &err))
+    fp_warn ("capture: %s", err->message);
+  else
+    fp_info ("capture: t%03u-f%u", touch, frame);
+}
 
 G_DEFINE_TYPE (FpiDeviceGoodixTls5125, fpi_device_goodixtls5125,
                FPI_TYPE_DEVICE_GOODIXTLS)
@@ -533,38 +572,52 @@ static gboolean
 match_print (FpPrint *print, const guint8 *prep, gint width, gint height, gint *score, GError **error)
 {
   g_autoptr(GVariant) data = NULL;
-  const guint8 *blob;
-  gsize len;
+  const guint8 *blobs[G5125_MAX_TEMPLATES];
+  gsize lens[G5125_MAX_TEMPLATES];
+  guint n;
 
   g_object_get (print, "fpi-data", &data, NULL);
-  if (!g5125_template_from_variant (data, &blob, &len))
+  n = g5125_templates_from_variant (data, blobs, lens, G5125_MAX_TEMPLATES);
+  if (n == 0)
     {
       g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
                    "Stored print is not a goodixtls5125 engine template");
       return FALSE;
     }
   *score = 0;
-  return goodix_engine_verify_image (prep, width, height, blob, len, score) == 1 &&
-         *score >= G5125_MATCH_THRESHOLD;
+  for (guint i = 0; i < n; i++)
+    {
+      gint s = 0;
+      gboolean hit = goodix_engine_verify_image (prep, width, height, blobs[i], lens[i], &s) == 1 &&
+                     s >= G5125_MATCH_THRESHOLD;
+
+      *score = MAX (*score, s);
+      if (hit)
+        return TRUE;
+    }
+  return FALSE;
 }
 
-static void
+/* Processes one frame of the current touch. Returns FALSE if the frame was
+ * unusable (preprocessing or the enrollment engine rejected it). Verify and
+ * identify keep the best result across the frames of one touch. */
+static gboolean
 handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
 {
   FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
   guint8 prep[G5125_PIXELS];
+  gboolean accepted = TRUE;
 
   gint width = self->native_12508 ? 80 : G5125_WIDTH;
   gint height = self->native_12508 ? 64 : G5125_HEIGHT;
-  self->frame_rejected = FALSE;
   if (self->native_12508)
     {
       guint quality = 0, coverage = 0;
-      self->frame_rejected = !goodix_engine_native_prepare (pix, prep, &quality, &coverage);
-      fp_dbg ("Factory preprocessing: quality %u coverage %u accepted %d",
-              quality, coverage, !self->frame_rejected);
-      if (self->frame_rejected)
-        return;
+      accepted = goodix_engine_native_prepare (pix, prep, &quality, &coverage);
+      fp_dbg ("Factory preprocessing: frame %u quality %u coverage %u accepted %d",
+              self->burst_idx, quality, coverage, accepted);
+      if (!accepted)
+        return FALSE;
     }
   else
     g5125_engine_prep (pix, prep);
@@ -577,8 +630,8 @@ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
         gint r = goodix_engine_enroll_add_image (self->enroll_ctx, prep, width,
                                                  height, &enrolled, &progress);
 
-        self->frame_rejected = (r != 0);
-        if (!self->frame_rejected)
+        accepted = (r == 0);
+        if (accepted)
           {
             self->enroll_stage++;
             self->enroll_progress = progress;
@@ -593,37 +646,58 @@ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
         gint score = 0;
 
         fpi_device_get_verify_data (dev, &print);
-        self->result = match_print (print, prep, width, height, &score, &self->result_error) ?
-                       FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
-        fp_dbg ("Verify: score %d (threshold %d)", score, G5125_MATCH_THRESHOLD);
+        if (match_print (print, prep, width, height, &score, &self->result_error))
+          self->result = FPI_MATCH_SUCCESS;
+        self->best_score = MAX (self->best_score, score);
+        fp_dbg ("Verify: frame %u score %d (threshold %d)", self->burst_idx, score,
+                G5125_MATCH_THRESHOLD);
         break;
       }
 
     case G5125_ACTION_IDENTIFY:
       {
         GPtrArray *prints = NULL;
-        gint best = -1;
 
         fpi_device_get_identify_data (dev, &prints);
-        self->identified = NULL;
         for (guint i = 0; prints && i < prints->len; i++)
           {
             g_autoptr(GError) err = NULL;
             gint score = 0;
 
-            if (match_print (g_ptr_array_index (prints, i), prep, width, height, &score, &err) && score > best)
+            if (match_print (g_ptr_array_index (prints, i), prep, width, height, &score, &err) &&
+                score > self->best_score)
               {
-                best = score;
+                self->best_score = score;
                 self->identified = g_ptr_array_index (prints, i);
               }
           }
-        fp_dbg ("Identify: best score %d", best);
+        fp_dbg ("Identify: frame %u best score %d", self->burst_idx, self->best_score);
         break;
       }
 
     case G5125_ACTION_NONE:
     default:
       break;
+    }
+  return accepted;
+}
+
+/* Whether the touch already has a final answer and needs no further frames. */
+static gboolean
+touch_decided (FpiDeviceGoodixTls5125 *self)
+{
+  if (g_getenv ("GOODIX5125_CAPTURE_DIR"))
+    return FALSE;                       /* capture keeps every burst frame */
+  switch (self->action)
+    {
+    case G5125_ACTION_ENROLL:
+      return TRUE;                      /* one sample per touch */
+    case G5125_ACTION_VERIFY:
+      return self->result == FPI_MATCH_SUCCESS || self->result_error != NULL;
+    case G5125_ACTION_IDENTIFY:
+      return self->identified != NULL;
+    default:
+      return TRUE;
     }
 }
 
@@ -647,12 +721,31 @@ on_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
   if ((self->native_12508 && length != G5125_NATIVE_PLAIN_LEN) ||
       !g5125_decode_image (data, length, pix))
     {
+      if (self->burst_idx > 0)
+        {
+          /* a later frame of the burst failed: decide on the frames we have */
+          self->frame_rejected = (self->frames_ok == 0);
+          fpi_ssm_next_state (ssm);
+          return;
+        }
       if (soft_error (self, ssm, "Image length or CRC is invalid"))
         fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
       return;
     }
 
-  handle_frame (dev, pix);
+  g5125_capture_frame (pix, self->burst_idx);
+  if (handle_frame (dev, pix))
+    self->frames_ok++;
+  self->burst_idx++;
+
+  if (self->burst_idx < (self->action == G5125_ACTION_ENROLL ? 1 : g5125_burst_frames ()) &&
+      !touch_decided (self))
+    {
+      /* read another frame while the finger is still down */
+      fpi_ssm_jump_to_state (ssm, SCAN_GET_IMAGE);
+      return;
+    }
+  self->frame_rejected = (self->frames_ok == 0);
   fpi_ssm_next_state (ssm);
 }
 
@@ -904,6 +997,10 @@ start_scan (FpDevice *dev)
 
   self->soft_errors = 0;
   self->frame_rejected = FALSE;
+  self->burst_idx = 0;
+  self->frames_ok = 0;
+  self->best_score = -1;
+  self->identified = NULL;
   self->scan_ssm = fpi_ssm_new (dev, scan_ssm_run, SCAN_NUM);
   fpi_ssm_start (self->scan_ssm, scan_complete);
 }
@@ -938,6 +1035,7 @@ start_action (FpDevice *dev, G5125Action action)
                                                         "Goodix engine could not start enrolment"));
           return;
         }
+      goodix_engine_enroll_set_target (self->enroll_ctx, fp_device_get_nr_enroll_stages (dev));
     }
   start_activation (dev);
 }
@@ -1119,7 +1217,14 @@ fpi_device_goodixtls5125_class_init (FpiDeviceGoodixTls5125Class *class)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-  dev_class->nr_enroll_stages = 12;   /* the engine keeps at most 12 images */
+  /* One template holds up to 32 images. On captured touches from this
+   * laptop, 20 enrollment touches accepted 33/40 casual touches against
+   * 27/40 for 12. */
+  dev_class->nr_enroll_stages = 20;
+  /* The sensor idles in finger-detect mode while waiting (Windows keeps it
+   * armed whenever the screen is on). The default 3-minute heat model would
+   * disable it on a lock screen that waits without a timeout. */
+  dev_class->temp_hot_seconds = -1;
 
   /* Matching is done by the Goodix engine, not libfprint's image pipeline */
   dev_class->open = dev_open;

@@ -1317,16 +1317,23 @@ void *goodix_engine_enroll_start (int *max_images) {
     if (!g_milan_available) return NULL;
     g_rec_mutex_lock (&g_milan_mutex);
     ensure_gs();
-    int max_imgs = 16;
+    int max_imgs = 32;   /* the engine accepts up to 32 images per template */
     void *ctx = m_enrolStartEx(&max_imgs);
     if (!ctx) {
         g_rec_mutex_unlock (&g_milan_mutex);
         return NULL;
     }
     if (max_images) *max_images = max_imgs;
-    *(u16*)((char*)ctx + 8) = 12; /* Target 12 enrollment touches */
+    *(u16*)((char*)ctx + 8) = 12; /* default target; see goodix_engine_enroll_set_target */
     g_rec_mutex_unlock (&g_milan_mutex);
     return ctx;
+}
+
+void goodix_engine_enroll_set_target (void *ctx, int images) {
+    if (!ctx || images <= 0) return;
+    g_rec_mutex_lock (&g_milan_mutex);
+    *(u16*)((char*)ctx + 8) = (u16) MIN (images, 32);
+    g_rec_mutex_unlock (&g_milan_mutex);
 }
 
 int goodix_engine_enroll_add_image (void *ctx,

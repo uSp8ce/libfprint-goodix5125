@@ -32,6 +32,7 @@ const char *goodix_engine_get_version (void);
 /* Start enrollment context. Sets *max_images (e.g. 16).
  * Returns opaque enrollment context pointer or NULL on failure. */
 void *goodix_engine_enroll_start (int *max_images);
+void  goodix_engine_enroll_set_target (void *ctx, int images);
 
 /* Feed one 64x80 or 80x64 8-bit normalized grayscale impression to enrollment.
  * Updates *enrolled_count and *progress_pct.

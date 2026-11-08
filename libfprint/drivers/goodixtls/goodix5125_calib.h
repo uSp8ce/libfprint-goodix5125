@@ -38,7 +38,9 @@
 #define G5125_IRQ_REVERSE2    0x0082
 #define G5125_ENGINE_GAIN     1.5f  /* high-pass gain the Goodix engine matches best with */
 #define G5125_MATCH_THRESHOLD 30    /* minimum engine score for a match */
-#define G5125_TEMPLATE_VERSION 3
+#define G5125_TEMPLATE_VERSION 3        /* (yay): one engine template */
+#define G5125_TEMPLATE_VERSION_MULTI 4  /* (yaay): several templates of one finger */
+#define G5125_MAX_TEMPLATES 8
 #define G5125_NATIVE_PLAIN_LEN (8 + G5125_PIXELS / 4 * 6 + 5)
 
 extern const guint8 g5125_config_12508[224];
@@ -88,3 +90,10 @@ GVariant *g5125_template_to_variant (const guint8 *blob,
 gboolean g5125_template_from_variant (GVariant      *v,
                                       const guint8 **blob,
                                       gsize         *len);
+GVariant *g5125_templates_to_variant (const guint8 * const *blobs,
+                                      const gsize          *lens,
+                                      guint                 n);
+guint    g5125_templates_from_variant (GVariant      *v,
+                                       const guint8 **blobs,
+                                       gsize         *lens,
+                                       guint          max);

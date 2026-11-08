@@ -355,3 +355,47 @@ g5125_template_from_variant (GVariant *v, const guint8 **blob, gsize *len)
   *blob = g_variant_get_fixed_array (data, len, 1);
   return *len > 0;
 }
+
+/* Version 4 prints hold several engine templates of the same finger, e.g. two
+ * enrollment sessions. Matching takes the best score over all of them. */
+GVariant *
+g5125_templates_to_variant (const guint8 * const *blobs, const gsize *lens, guint n)
+{
+  GVariantBuilder b;
+
+  g_variant_builder_init (&b, G_VARIANT_TYPE ("aay"));
+  for (guint i = 0; i < n; i++)
+    g_variant_builder_add_value (&b, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+                                                                blobs[i], lens[i], 1));
+  return g_variant_new ("(y@aay)", G5125_TEMPLATE_VERSION_MULTI, g_variant_builder_end (&b));
+}
+
+/* Reads a version 3 or version 4 print. Returns the number of templates (0 if
+ * the data is not a goodixtls5125 print). Pointers stay owned by v. */
+guint
+g5125_templates_from_variant (GVariant *v, const guint8 **blobs, gsize *lens, guint max)
+{
+  g_autoptr(GVariant) arr = NULL;
+  guint8 version;
+  guint n;
+
+  if (max == 0 || !v)
+    return 0;
+  if (g5125_template_from_variant (v, &blobs[0], &lens[0]))
+    return 1;
+  if (!g_variant_is_of_type (v, G_VARIANT_TYPE ("(yaay)")))
+    return 0;
+  g_variant_get (v, "(y@aay)", &version, &arr);
+  if (version != G5125_TEMPLATE_VERSION_MULTI)
+    return 0;
+  n = MIN (g_variant_n_children (arr), max);
+  for (guint i = 0; i < n; i++)
+    {
+      g_autoptr(GVariant) child = g_variant_get_child_value (arr, i);
+
+      blobs[i] = g_variant_get_fixed_array (child, &lens[i], 1);
+      if (lens[i] == 0)
+        return 0;
+    }
+  return n;
+}

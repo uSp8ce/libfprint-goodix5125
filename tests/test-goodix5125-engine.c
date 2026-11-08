@@ -86,6 +86,32 @@ test_fresh_probe_roundtrip (void)
   free (blob);
 }
 
+/* 20-image enrollment (the driver's stage count) fills and completes. */
+static void
+test_enroll_target_20 (void)
+{
+  guint8 enrolled[5120];
+  guint8 *blob = NULL;
+  size_t length = 0;
+  int count = 0, progress = 0, max_images = 0, score = 0;
+  void *ctx;
+
+  make_pattern (enrolled, FALSE);
+  ctx = goodix_engine_enroll_start (&max_images);
+  g_assert_nonnull (ctx);
+  goodix_engine_enroll_set_target (ctx, 20);
+  for (int i = 0; i < 20; i++)
+    g_assert_cmpint (goodix_engine_enroll_add_image (ctx, enrolled, 64, 80,
+                                                    &count, &progress), ==, 0);
+  g_assert_cmpint (count, ==, 20);
+  g_assert_cmpint (progress, ==, 100);
+  g_assert_cmpint (goodix_engine_enroll_commit (ctx, &blob, &length), ==, 0);
+  goodix_engine_enroll_finish (ctx);
+  g_assert_cmpint (goodix_engine_verify_image (enrolled, 64, 80, blob, length, &score), ==, 1);
+  g_assert_cmpint (score, >=, 30);
+  free (blob);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -111,13 +137,14 @@ main (int argc, char *argv[])
       return 1;
     }
   ctx = goodix_engine_enroll_start (&max_images);
-  if (!ctx || max_images != 16)
+  if (!ctx || max_images != 32)
     {
       g_printerr ("enroll_start: ctx=%p max_images=%d\n", ctx, max_images);
       return 1;
     }
   goodix_engine_enroll_finish (ctx);
   test_fresh_probe_roundtrip ();
+  test_enroll_target_20 ();
   g_print ("engine %s ok\n", goodix_engine_get_version ());
   return 0;
 }

@@ -18,6 +18,7 @@
 // License along with this library; if not, write to the Free Software
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
+#include "goodix5125_paths.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <glib.h>
@@ -212,6 +213,8 @@ goodix_tls_server_init (GoodixTlsServer *self, GError **error)
 {
   memset (self->psk, 0, sizeof self->psk);
   const char *key_path = g_getenv ("GOODIX5125_PSK_FILE");
+  if (!key_path && g_file_test (GOODIX5125_MATERIALS_DIR "/psk.bin", G_FILE_TEST_EXISTS))
+    key_path = GOODIX5125_MATERIALS_DIR "/psk.bin";
   if (key_path && *key_path)
     {
       int fd = open (key_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);

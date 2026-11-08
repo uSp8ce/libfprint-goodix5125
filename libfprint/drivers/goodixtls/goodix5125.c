@@ -19,6 +19,7 @@
 
 #define FP_COMPONENT "goodixtls5125"
 
+#include "goodix5125_paths.h"
 #include "drivers_api.h"
 #include "goodix_proto.h"
 #include "goodix.h"
@@ -209,8 +210,15 @@ on_frame_check (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
     }
   fp_info ("Native image validated: %u bytes, 5120 pixels, CRC correct", length);
   GError *prep_error = NULL;
-  if (!goodix_engine_native_preprocess_init (g_getenv ("GOODIX5125_CALIBRATION_FILE"),
-                                              g_getenv ("GOODIX5125_BASELINE_FILE"),
+  const char *calib = g_getenv ("GOODIX5125_CALIBRATION_FILE");
+  const char *baseline = g_getenv ("GOODIX5125_BASELINE_FILE");
+
+  if (!calib)
+    calib = GOODIX5125_MATERIALS_DIR "/calibration.dat";
+  if (!baseline)
+    baseline = GOODIX5125_MATERIALS_DIR "/baseline.raw";
+  if (!goodix_engine_native_preprocess_init (calib,
+                                              baseline,
                                               &prep_error))
     {
       fpi_ssm_mark_failed (ssm, prep_error);

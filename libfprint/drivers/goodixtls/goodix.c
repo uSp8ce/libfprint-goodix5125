@@ -1358,6 +1358,11 @@ tls_handshake_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     dev, on_tls_successfully_established, NULL);
 }
 
+/* The TLS server runs in-process over a socketpair: once a flight's records
+ * are complete, 20 ms without more data is enough (200 ms added 0.36 s to
+ * every activation). */
+#define G_TLS_QUIET_MS 20
+
 static void
 tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
 {
@@ -1370,7 +1375,7 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
   if (stage == TLS_HANDSHAKE_STAGE_HELLO_S)
     {
       guint8 buff[4096];
-      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), 200);
+      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), G_TLS_QUIET_MS);
       if (size < 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
@@ -1396,7 +1401,7 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
     {
       fp_dbg ("Reading to proxy back");
       guint8 buff[4096];
-      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), 200);
+      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), G_TLS_QUIET_MS);
       if (size < 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,

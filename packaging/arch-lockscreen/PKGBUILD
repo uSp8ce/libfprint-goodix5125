@@ -1,0 +1,18 @@
+# Keeps Plasma's lock screen authentication running while the lock UI is
+# hidden, so a fingerprint unlocks from the clock screen without a key press
+# first, and fingerprint restarts after failed touches.
+pkgname=kscreenlocker-fingerprint-idle
+pkgver=2
+pkgrel=1
+pkgdesc='Arm fingerprint unlock on the Plasma lock screen without waking the UI first'
+arch=('any')
+license=('LGPL-2.1-or-later')
+depends=('plasma-desktop')
+install=kscreenlocker-fingerprint-idle.install
+source=('kscreenlocker-fingerprint-idle' '90-kscreenlocker-fingerprint-idle.hook')
+sha256sums=('SKIP' 'SKIP')
+
+package() {
+  install -Dm755 kscreenlocker-fingerprint-idle "$pkgdir/usr/lib/kscreenlocker-fingerprint-idle/kscreenlocker-fingerprint-idle"
+  install -Dm644 90-kscreenlocker-fingerprint-idle.hook "$pkgdir/usr/share/libalpm/hooks/90-kscreenlocker-fingerprint-idle.hook"
+}

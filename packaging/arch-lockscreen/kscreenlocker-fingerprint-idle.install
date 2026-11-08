@@ -1,0 +1,3 @@
+post_install() { /usr/lib/kscreenlocker-fingerprint-idle/kscreenlocker-fingerprint-idle apply; }
+post_upgrade() { post_install; }
+pre_remove() { /usr/lib/kscreenlocker-fingerprint-idle/kscreenlocker-fingerprint-idle revert; }

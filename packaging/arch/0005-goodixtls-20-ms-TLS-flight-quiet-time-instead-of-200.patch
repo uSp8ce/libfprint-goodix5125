@@ -1,0 +1,49 @@
+From 7fcba8c640aaf9f122a9b92a15d5168f270477e3 Mon Sep 17 00:00:00 2001
+From: uSp8ce <99090718+uSp8ce@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:10:40 +0000
+Subject: [PATCH 5/5] goodixtls: 20 ms TLS flight quiet time instead of 200 ms
+
+The handshake read waited 200 ms after each complete server flight. The
+TLS server is in-process, so 20 ms is enough; activation drops from about
+0.65 s to 0.27 s (8/8 handshakes succeeded).
+---
+ libfprint/drivers/goodixtls/goodix.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/libfprint/drivers/goodixtls/goodix.c b/libfprint/drivers/goodixtls/goodix.c
+index 9671917..8e4aa26 100644
+--- a/libfprint/drivers/goodixtls/goodix.c
++++ b/libfprint/drivers/goodixtls/goodix.c
+@@ -1358,6 +1358,11 @@ tls_handshake_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+     dev, on_tls_successfully_established, NULL);
+ }
+ 
++/* The TLS server runs in-process over a socketpair: once a flight's records
++ * are complete, 20 ms without more data is enough (200 ms added 0.36 s to
++ * every activation). */
++#define G_TLS_QUIET_MS 20
++
+ static void
+ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
+ {
+@@ -1370,7 +1375,7 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
+   if (stage == TLS_HANDSHAKE_STAGE_HELLO_S)
+     {
+       guint8 buff[4096];
+-      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), 200);
++      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), G_TLS_QUIET_MS);
+       if (size < 0)
+         {
+           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
+@@ -1396,7 +1401,7 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
+     {
+       fp_dbg ("Reading to proxy back");
+       guint8 buff[4096];
+-      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), 200);
++      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), G_TLS_QUIET_MS);
+       if (size < 0)
+         {
+           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
+-- 
+2.56.0
+

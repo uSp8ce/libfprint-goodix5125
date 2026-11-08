@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/LockScreenUi.qml
+
+[Action]
+Description = Keeping lock screen fingerprint unlock armed while the screen is idle...
+When = PostTransaction
+Exec = /usr/lib/kscreenlocker-fingerprint-idle/kscreenlocker-fingerprint-idle apply

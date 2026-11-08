@@ -1,0 +1,26 @@
+#!/bin/sh
+# Plasma's lock screen (re)starts authentication from a heartbeat timer that
+# runs only while its UI is visible, once a second. Fingerprint is then not
+# armed on the clock screen, stays off after failed touches once the UI
+# fades, and the first attempt after locking ("Worker not ready yet") is
+# retried only 1 s later. This keeps the heartbeat running for as long as
+# the screen is locked, every 250 ms (the call returns at once when
+# authentication is already running).
+# Usage: kscreenlocker-fingerprint-idle [apply|revert]
+f=/usr/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/LockScreenUi.qml
+tag='kscreenlocker-fingerprint-idle'
+[ -f "$f" ] || exit 0
+case "${1:-apply}" in
+  apply)
+    if ! grep -q 'running: !authenticator.unlocked && parent.uiVisible' "$f" && ! grep -q "$tag" "$f"; then
+      echo "$tag: heartbeat timer not found in $f, not patched" >&2
+      exit 0
+    fi
+    sed -i \
+      -e "s|running: !authenticator.unlocked && parent.uiVisible|running: !authenticator.unlocked /* $tag */|" \
+      -e "/heart beat keeping the backend active/{n;s|interval: 1000\$|interval: 250 /* $tag */|}" "$f" ;;
+  revert)
+    sed -i \
+      -e "s|running: !authenticator.unlocked /\* $tag \*/|running: !authenticator.unlocked \&\& parent.uiVisible|" \
+      -e "s|interval: 250 /\* $tag \*/|interval: 1000|" "$f" ;;
+esac

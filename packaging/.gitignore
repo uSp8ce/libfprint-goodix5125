@@ -1,0 +1,5 @@
+*.pkg.tar.zst
+*.cab
+src/
+pkg/
+arch/libfprint-goodix5125/

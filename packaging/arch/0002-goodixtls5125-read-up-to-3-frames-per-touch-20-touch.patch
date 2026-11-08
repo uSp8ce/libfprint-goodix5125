@@ -1,0 +1,878 @@
+From 800bacc340446d7596acd83492ff74d174a3f0f5 Mon Sep 17 00:00:00 2001
+From: uSp8ce <99090718+uSp8ce@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 14:32:08 +0000
+Subject: [PATCH 2/5] goodixtls5125: read up to 3 frames per touch, 20-touch
+ enrollment, multi-template prints, no heat cutoff
+
+- Verify/identify read up to 3 frames per touch (about 80 ms apart) and stop
+  at the first match, so a touch that starts off-centre still matches.
+- Enrollment takes 20 touches (the engine holds 32 images per template; the
+  old comment saying 12 was the limit was wrong).
+- Prints can hold several engine templates (format version 4); matching
+  takes the best score over all of them. Version 3 prints still load.
+- temp_hot_seconds = -1: libfprint's default model disabled the reader after
+  3 minutes of waiting, which broke the lock screen's no-timeout PAM entry.
+- GOODIX5125_CAPTURE_DIR / GOODIX5125_BURST for touch capture, plus the
+  capture loop and offline evaluation harness under tools/.
+---
+ .gitignore                                    |   1 +
+ libfprint/drivers/goodixtls/goodix5125.c      | 153 ++++++++++--
+ .../drivers/goodixtls/goodix5125_calib.c      |  44 ++++
+ .../drivers/goodixtls/goodix5125_calib.h      |  11 +-
+ libfprint/drivers/goodixtls/goodix_engine.c   |  11 +-
+ libfprint/drivers/goodixtls/goodix_engine.h   |   1 +
+ tests/test-goodix5125-calib.c                 |  24 ++
+ tests/test-goodix5125-engine.c                |  29 ++-
+ tools/build-dev.sh                            |  15 ++
+ tools/capture-run.sh                          |  16 ++
+ tools/g5125-capture.c                         |  76 ++++++
+ tools/g5125-eval.c                            | 222 ++++++++++++++++++
+ 12 files changed, 575 insertions(+), 28 deletions(-)
+ create mode 100644 tools/build-dev.sh
+ create mode 100755 tools/capture-run.sh
+ create mode 100644 tools/g5125-capture.c
+ create mode 100644 tools/g5125-eval.c
+
+diff --git a/.gitignore b/.gitignore
+index 07d7399..b17ca1d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,4 @@
+ *.o
+ *.swp
+ _build
++build/
+diff --git a/libfprint/drivers/goodixtls/goodix5125.c b/libfprint/drivers/goodixtls/goodix5125.c
+index 56e1be8..e9a42dc 100644
+--- a/libfprint/drivers/goodixtls/goodix5125.c
++++ b/libfprint/drivers/goodixtls/goodix5125.c
+@@ -61,8 +61,47 @@ struct _FpiDeviceGoodixTls5125
+   FpiMatchResult     result;
+   FpPrint           *identified;
+   GError            *result_error;
++
++  /* frames read for the current touch, and how many passed preprocessing */
++  guint              burst_idx;
++  guint              frames_ok;
++  gint               best_score;
+ };
+ 
++/* Frames read per touch for verify/identify. GOODIX5125_BURST overrides. */
++#define G5125_BURST_DEFAULT 3
++
++static guint
++g5125_burst_frames (void)
++{
++  const char *s = g_getenv ("GOODIX5125_BURST");
++  gint n = s ? atoi (s) : G5125_BURST_DEFAULT;
++
++  return CLAMP (n, 1, 5);
++}
++
++/* Debug capture: GOODIX5125_CAPTURE_DIR=<dir> saves every decoded frame as
++ * t<touch>-f<frame>.raw (5120 little-endian u16, wire order). */
++static void
++g5125_capture_frame (const guint16 pix[G5125_PIXELS], guint frame)
++{
++  static guint touch;
++  const char *dir = g_getenv ("GOODIX5125_CAPTURE_DIR");
++  g_autofree gchar *path = NULL;
++  g_autoptr(GError) err = NULL;
++
++  if (!dir || !*dir)
++    return;
++  if (frame == 0)
++    touch++;
++  path = g_strdup_printf ("%s/t%03u-f%u.raw", dir, touch, frame);
++  if (!g_file_set_contents_full (path, (const gchar *) pix, G5125_PIXELS * 2,
++                                 G_FILE_SET_CONTENTS_NONE, 0600, &err))
++    fp_warn ("capture: %s", err->message);
++  else
++    fp_info ("capture: t%03u-f%u", touch, frame);
++}
++
+ G_DEFINE_TYPE (FpiDeviceGoodixTls5125, fpi_device_goodixtls5125,
+                FPI_TYPE_DEVICE_GOODIXTLS)
+ 
+@@ -533,38 +572,52 @@ static gboolean
+ match_print (FpPrint *print, const guint8 *prep, gint width, gint height, gint *score, GError **error)
+ {
+   g_autoptr(GVariant) data = NULL;
+-  const guint8 *blob;
+-  gsize len;
++  const guint8 *blobs[G5125_MAX_TEMPLATES];
++  gsize lens[G5125_MAX_TEMPLATES];
++  guint n;
+ 
+   g_object_get (print, "fpi-data", &data, NULL);
+-  if (!g5125_template_from_variant (data, &blob, &len))
++  n = g5125_templates_from_variant (data, blobs, lens, G5125_MAX_TEMPLATES);
++  if (n == 0)
+     {
+       g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                    "Stored print is not a goodixtls5125 engine template");
+       return FALSE;
+     }
+   *score = 0;
+-  return goodix_engine_verify_image (prep, width, height, blob, len, score) == 1 &&
+-         *score >= G5125_MATCH_THRESHOLD;
++  for (guint i = 0; i < n; i++)
++    {
++      gint s = 0;
++      gboolean hit = goodix_engine_verify_image (prep, width, height, blobs[i], lens[i], &s) == 1 &&
++                     s >= G5125_MATCH_THRESHOLD;
++
++      *score = MAX (*score, s);
++      if (hit)
++        return TRUE;
++    }
++  return FALSE;
+ }
+ 
+-static void
++/* Processes one frame of the current touch. Returns FALSE if the frame was
++ * unusable (preprocessing or the enrollment engine rejected it). Verify and
++ * identify keep the best result across the frames of one touch. */
++static gboolean
+ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
+ {
+   FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+   guint8 prep[G5125_PIXELS];
++  gboolean accepted = TRUE;
+ 
+   gint width = self->native_12508 ? 80 : G5125_WIDTH;
+   gint height = self->native_12508 ? 64 : G5125_HEIGHT;
+-  self->frame_rejected = FALSE;
+   if (self->native_12508)
+     {
+       guint quality = 0, coverage = 0;
+-      self->frame_rejected = !goodix_engine_native_prepare (pix, prep, &quality, &coverage);
+-      fp_dbg ("Factory preprocessing: quality %u coverage %u accepted %d",
+-              quality, coverage, !self->frame_rejected);
+-      if (self->frame_rejected)
+-        return;
++      accepted = goodix_engine_native_prepare (pix, prep, &quality, &coverage);
++      fp_dbg ("Factory preprocessing: frame %u quality %u coverage %u accepted %d",
++              self->burst_idx, quality, coverage, accepted);
++      if (!accepted)
++        return FALSE;
+     }
+   else
+     g5125_engine_prep (pix, prep);
+@@ -577,8 +630,8 @@ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
+         gint r = goodix_engine_enroll_add_image (self->enroll_ctx, prep, width,
+                                                  height, &enrolled, &progress);
+ 
+-        self->frame_rejected = (r != 0);
+-        if (!self->frame_rejected)
++        accepted = (r == 0);
++        if (accepted)
+           {
+             self->enroll_stage++;
+             self->enroll_progress = progress;
+@@ -593,31 +646,32 @@ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
+         gint score = 0;
+ 
+         fpi_device_get_verify_data (dev, &print);
+-        self->result = match_print (print, prep, width, height, &score, &self->result_error) ?
+-                       FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+-        fp_dbg ("Verify: score %d (threshold %d)", score, G5125_MATCH_THRESHOLD);
++        if (match_print (print, prep, width, height, &score, &self->result_error))
++          self->result = FPI_MATCH_SUCCESS;
++        self->best_score = MAX (self->best_score, score);
++        fp_dbg ("Verify: frame %u score %d (threshold %d)", self->burst_idx, score,
++                G5125_MATCH_THRESHOLD);
+         break;
+       }
+ 
+     case G5125_ACTION_IDENTIFY:
+       {
+         GPtrArray *prints = NULL;
+-        gint best = -1;
+ 
+         fpi_device_get_identify_data (dev, &prints);
+-        self->identified = NULL;
+         for (guint i = 0; prints && i < prints->len; i++)
+           {
+             g_autoptr(GError) err = NULL;
+             gint score = 0;
+ 
+-            if (match_print (g_ptr_array_index (prints, i), prep, width, height, &score, &err) && score > best)
++            if (match_print (g_ptr_array_index (prints, i), prep, width, height, &score, &err) &&
++                score > self->best_score)
+               {
+-                best = score;
++                self->best_score = score;
+                 self->identified = g_ptr_array_index (prints, i);
+               }
+           }
+-        fp_dbg ("Identify: best score %d", best);
++        fp_dbg ("Identify: frame %u best score %d", self->burst_idx, self->best_score);
+         break;
+       }
+ 
+@@ -625,6 +679,26 @@ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
+     default:
+       break;
+     }
++  return accepted;
++}
++
++/* Whether the touch already has a final answer and needs no further frames. */
++static gboolean
++touch_decided (FpiDeviceGoodixTls5125 *self)
++{
++  if (g_getenv ("GOODIX5125_CAPTURE_DIR"))
++    return FALSE;                       /* capture keeps every burst frame */
++  switch (self->action)
++    {
++    case G5125_ACTION_ENROLL:
++      return TRUE;                      /* one sample per touch */
++    case G5125_ACTION_VERIFY:
++      return self->result == FPI_MATCH_SUCCESS || self->result_error != NULL;
++    case G5125_ACTION_IDENTIFY:
++      return self->identified != NULL;
++    default:
++      return TRUE;
++    }
+ }
+ 
+ static void
+@@ -647,12 +721,31 @@ on_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+   if ((self->native_12508 && length != G5125_NATIVE_PLAIN_LEN) ||
+       !g5125_decode_image (data, length, pix))
+     {
++      if (self->burst_idx > 0)
++        {
++          /* a later frame of the burst failed: decide on the frames we have */
++          self->frame_rejected = (self->frames_ok == 0);
++          fpi_ssm_next_state (ssm);
++          return;
++        }
+       if (soft_error (self, ssm, "Image length or CRC is invalid"))
+         fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
+       return;
+     }
+ 
+-  handle_frame (dev, pix);
++  g5125_capture_frame (pix, self->burst_idx);
++  if (handle_frame (dev, pix))
++    self->frames_ok++;
++  self->burst_idx++;
++
++  if (self->burst_idx < (self->action == G5125_ACTION_ENROLL ? 1 : g5125_burst_frames ()) &&
++      !touch_decided (self))
++    {
++      /* read another frame while the finger is still down */
++      fpi_ssm_jump_to_state (ssm, SCAN_GET_IMAGE);
++      return;
++    }
++  self->frame_rejected = (self->frames_ok == 0);
+   fpi_ssm_next_state (ssm);
+ }
+ 
+@@ -904,6 +997,10 @@ start_scan (FpDevice *dev)
+ 
+   self->soft_errors = 0;
+   self->frame_rejected = FALSE;
++  self->burst_idx = 0;
++  self->frames_ok = 0;
++  self->best_score = -1;
++  self->identified = NULL;
+   self->scan_ssm = fpi_ssm_new (dev, scan_ssm_run, SCAN_NUM);
+   fpi_ssm_start (self->scan_ssm, scan_complete);
+ }
+@@ -938,6 +1035,7 @@ start_action (FpDevice *dev, G5125Action action)
+                                                         "Goodix engine could not start enrolment"));
+           return;
+         }
++      goodix_engine_enroll_set_target (self->enroll_ctx, fp_device_get_nr_enroll_stages (dev));
+     }
+   start_activation (dev);
+ }
+@@ -1119,7 +1217,14 @@ fpi_device_goodixtls5125_class_init (FpiDeviceGoodixTls5125Class *class)
+   dev_class->type = FP_DEVICE_TYPE_USB;
+   dev_class->id_table = id_table;
+   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+-  dev_class->nr_enroll_stages = 12;   /* the engine keeps at most 12 images */
++  /* One template holds up to 32 images. On captured touches from this
++   * laptop, 20 enrollment touches accepted 33/40 casual touches against
++   * 27/40 for 12. */
++  dev_class->nr_enroll_stages = 20;
++  /* The sensor idles in finger-detect mode while waiting (Windows keeps it
++   * armed whenever the screen is on). The default 3-minute heat model would
++   * disable it on a lock screen that waits without a timeout. */
++  dev_class->temp_hot_seconds = -1;
+ 
+   /* Matching is done by the Goodix engine, not libfprint's image pipeline */
+   dev_class->open = dev_open;
+diff --git a/libfprint/drivers/goodixtls/goodix5125_calib.c b/libfprint/drivers/goodixtls/goodix5125_calib.c
+index 9962bbd..7856a50 100644
+--- a/libfprint/drivers/goodixtls/goodix5125_calib.c
++++ b/libfprint/drivers/goodixtls/goodix5125_calib.c
+@@ -355,3 +355,47 @@ g5125_template_from_variant (GVariant *v, const guint8 **blob, gsize *len)
+   *blob = g_variant_get_fixed_array (data, len, 1);
+   return *len > 0;
+ }
++
++/* Version 4 prints hold several engine templates of the same finger, e.g. two
++ * enrollment sessions. Matching takes the best score over all of them. */
++GVariant *
++g5125_templates_to_variant (const guint8 * const *blobs, const gsize *lens, guint n)
++{
++  GVariantBuilder b;
++
++  g_variant_builder_init (&b, G_VARIANT_TYPE ("aay"));
++  for (guint i = 0; i < n; i++)
++    g_variant_builder_add_value (&b, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                                blobs[i], lens[i], 1));
++  return g_variant_new ("(y@aay)", G5125_TEMPLATE_VERSION_MULTI, g_variant_builder_end (&b));
++}
++
++/* Reads a version 3 or version 4 print. Returns the number of templates (0 if
++ * the data is not a goodixtls5125 print). Pointers stay owned by v. */
++guint
++g5125_templates_from_variant (GVariant *v, const guint8 **blobs, gsize *lens, guint max)
++{
++  g_autoptr(GVariant) arr = NULL;
++  guint8 version;
++  guint n;
++
++  if (max == 0 || !v)
++    return 0;
++  if (g5125_template_from_variant (v, &blobs[0], &lens[0]))
++    return 1;
++  if (!g_variant_is_of_type (v, G_VARIANT_TYPE ("(yaay)")))
++    return 0;
++  g_variant_get (v, "(y@aay)", &version, &arr);
++  if (version != G5125_TEMPLATE_VERSION_MULTI)
++    return 0;
++  n = MIN (g_variant_n_children (arr), max);
++  for (guint i = 0; i < n; i++)
++    {
++      g_autoptr(GVariant) child = g_variant_get_child_value (arr, i);
++
++      blobs[i] = g_variant_get_fixed_array (child, &lens[i], 1);
++      if (lens[i] == 0)
++        return 0;
++    }
++  return n;
++}
+diff --git a/libfprint/drivers/goodixtls/goodix5125_calib.h b/libfprint/drivers/goodixtls/goodix5125_calib.h
+index a4a89ec..a36ef6b 100644
+--- a/libfprint/drivers/goodixtls/goodix5125_calib.h
++++ b/libfprint/drivers/goodixtls/goodix5125_calib.h
+@@ -38,7 +38,9 @@
+ #define G5125_IRQ_REVERSE2    0x0082
+ #define G5125_ENGINE_GAIN     1.5f  /* high-pass gain the Goodix engine matches best with */
+ #define G5125_MATCH_THRESHOLD 30    /* minimum engine score for a match */
+-#define G5125_TEMPLATE_VERSION 3
++#define G5125_TEMPLATE_VERSION 3        /* (yay): one engine template */
++#define G5125_TEMPLATE_VERSION_MULTI 4  /* (yaay): several templates of one finger */
++#define G5125_MAX_TEMPLATES 8
+ #define G5125_NATIVE_PLAIN_LEN (8 + G5125_PIXELS / 4 * 6 + 5)
+ 
+ extern const guint8 g5125_config_12508[224];
+@@ -88,3 +90,10 @@ GVariant *g5125_template_to_variant (const guint8 *blob,
+ gboolean g5125_template_from_variant (GVariant      *v,
+                                       const guint8 **blob,
+                                       gsize         *len);
++GVariant *g5125_templates_to_variant (const guint8 * const *blobs,
++                                      const gsize          *lens,
++                                      guint                 n);
++guint    g5125_templates_from_variant (GVariant      *v,
++                                       const guint8 **blobs,
++                                       gsize         *lens,
++                                       guint          max);
+diff --git a/libfprint/drivers/goodixtls/goodix_engine.c b/libfprint/drivers/goodixtls/goodix_engine.c
+index cd6a269..38e564c 100644
+--- a/libfprint/drivers/goodixtls/goodix_engine.c
++++ b/libfprint/drivers/goodixtls/goodix_engine.c
+@@ -1317,18 +1317,25 @@ void *goodix_engine_enroll_start (int *max_images) {
+     if (!g_milan_available) return NULL;
+     g_rec_mutex_lock (&g_milan_mutex);
+     ensure_gs();
+-    int max_imgs = 16;
++    int max_imgs = 32;   /* the engine accepts up to 32 images per template */
+     void *ctx = m_enrolStartEx(&max_imgs);
+     if (!ctx) {
+         g_rec_mutex_unlock (&g_milan_mutex);
+         return NULL;
+     }
+     if (max_images) *max_images = max_imgs;
+-    *(u16*)((char*)ctx + 8) = 12; /* Target 12 enrollment touches */
++    *(u16*)((char*)ctx + 8) = 12; /* default target; see goodix_engine_enroll_set_target */
+     g_rec_mutex_unlock (&g_milan_mutex);
+     return ctx;
+ }
+ 
++void goodix_engine_enroll_set_target (void *ctx, int images) {
++    if (!ctx || images <= 0) return;
++    g_rec_mutex_lock (&g_milan_mutex);
++    *(u16*)((char*)ctx + 8) = (u16) MIN (images, 32);
++    g_rec_mutex_unlock (&g_milan_mutex);
++}
++
+ int goodix_engine_enroll_add_image (void *ctx,
+                                    const uint8_t *pixels,
+                                    int width,
+diff --git a/libfprint/drivers/goodixtls/goodix_engine.h b/libfprint/drivers/goodixtls/goodix_engine.h
+index 710acdc..9080903 100644
+--- a/libfprint/drivers/goodixtls/goodix_engine.h
++++ b/libfprint/drivers/goodixtls/goodix_engine.h
+@@ -32,6 +32,7 @@ const char *goodix_engine_get_version (void);
+ /* Start enrollment context. Sets *max_images (e.g. 16).
+  * Returns opaque enrollment context pointer or NULL on failure. */
+ void *goodix_engine_enroll_start (int *max_images);
++void  goodix_engine_enroll_set_target (void *ctx, int images);
+ 
+ /* Feed one 64x80 or 80x64 8-bit normalized grayscale impression to enrollment.
+  * Updates *enrolled_count and *progress_pct.
+diff --git a/tests/test-goodix5125-calib.c b/tests/test-goodix5125-calib.c
+index cd4b2e0..a6f9d33 100644
+--- a/tests/test-goodix5125-calib.c
++++ b/tests/test-goodix5125-calib.c
+@@ -447,11 +447,35 @@ test_template_rejects_bad_data (void)
+   g_assert_false (g5125_template_from_variant (empty, &out, &len));
+ }
+ 
++static void
++test_templates_variant (void)
++{
++  const guint8 a[] = { 1, 2, 3 }, b[] = { 9, 8, 7, 6, 5 };
++  const guint8 *in[] = { a, b };
++  const gsize inlen[] = { sizeof a, sizeof b };
++  const guint8 *out[G5125_MAX_TEMPLATES];
++  gsize outlen[G5125_MAX_TEMPLATES];
++  g_autoptr(GVariant) multi = g_variant_ref_sink (g5125_templates_to_variant (in, inlen, 2));
++  g_autoptr(GVariant) single = g_variant_ref_sink (g5125_template_to_variant (b, sizeof b));
++  g_autoptr(GVariant) wrong = g_variant_ref_sink (g_variant_new ("(y@aay)", 9,
++                                                   g_variant_new_array (G_VARIANT_TYPE ("ay"), NULL, 0)));
++
++  g_assert_cmpuint (g5125_templates_from_variant (multi, out, outlen, G5125_MAX_TEMPLATES), ==, 2);
++  g_assert_cmpmem (out[0], outlen[0], a, sizeof a);
++  g_assert_cmpmem (out[1], outlen[1], b, sizeof b);
++  g_assert_cmpuint (g5125_templates_from_variant (multi, out, outlen, 1), ==, 1);
++  g_assert_cmpuint (g5125_templates_from_variant (single, out, outlen, G5125_MAX_TEMPLATES), ==, 1);
++  g_assert_cmpmem (out[0], outlen[0], b, sizeof b);
++  g_assert_cmpuint (g5125_templates_from_variant (wrong, out, outlen, G5125_MAX_TEMPLATES), ==, 0);
++  g_assert_cmpuint (g5125_templates_from_variant (NULL, out, outlen, G5125_MAX_TEMPLATES), ==, 0);
++}
++
+ int
+ main (int argc, char *argv[])
+ {
+   g_test_init (&argc, &argv, NULL);
+   g_test_add_func ("/goodix5125/image/native-crc", test_decode_native_image);
++  g_test_add_func ("/goodix5125/templates-variant", test_templates_variant);
+   g_test_add_func ("/goodix5125/config/native", test_native_config);
+   g_test_add_func ("/goodix5125/otp/check-ok", test_otp_check_ok);
+   g_test_add_func ("/goodix5125/otp/check-corrupt", test_otp_check_detects_corruption);
+diff --git a/tests/test-goodix5125-engine.c b/tests/test-goodix5125-engine.c
+index 68d4da0..c68f20a 100644
+--- a/tests/test-goodix5125-engine.c
++++ b/tests/test-goodix5125-engine.c
+@@ -86,6 +86,32 @@ test_fresh_probe_roundtrip (void)
+   free (blob);
+ }
+ 
++/* 20-image enrollment (the driver's stage count) fills and completes. */
++static void
++test_enroll_target_20 (void)
++{
++  guint8 enrolled[5120];
++  guint8 *blob = NULL;
++  size_t length = 0;
++  int count = 0, progress = 0, max_images = 0, score = 0;
++  void *ctx;
++
++  make_pattern (enrolled, FALSE);
++  ctx = goodix_engine_enroll_start (&max_images);
++  g_assert_nonnull (ctx);
++  goodix_engine_enroll_set_target (ctx, 20);
++  for (int i = 0; i < 20; i++)
++    g_assert_cmpint (goodix_engine_enroll_add_image (ctx, enrolled, 64, 80,
++                                                    &count, &progress), ==, 0);
++  g_assert_cmpint (count, ==, 20);
++  g_assert_cmpint (progress, ==, 100);
++  g_assert_cmpint (goodix_engine_enroll_commit (ctx, &blob, &length), ==, 0);
++  goodix_engine_enroll_finish (ctx);
++  g_assert_cmpint (goodix_engine_verify_image (enrolled, 64, 80, blob, length, &score), ==, 1);
++  g_assert_cmpint (score, >=, 30);
++  free (blob);
++}
++
+ int
+ main (int argc, char *argv[])
+ {
+@@ -111,13 +137,14 @@ main (int argc, char *argv[])
+       return 1;
+     }
+   ctx = goodix_engine_enroll_start (&max_images);
+-  if (!ctx || max_images != 16)
++  if (!ctx || max_images != 32)
+     {
+       g_printerr ("enroll_start: ctx=%p max_images=%d\n", ctx, max_images);
+       return 1;
+     }
+   goodix_engine_enroll_finish (ctx);
+   test_fresh_probe_roundtrip ();
++  test_enroll_target_20 ();
+   g_print ("engine %s ok\n", goodix_engine_get_version ());
+   return 0;
+ }
+diff --git a/tools/build-dev.sh b/tools/build-dev.sh
+new file mode 100644
+index 0000000..3bc7d37
+--- /dev/null
++++ b/tools/build-dev.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++# Dev build of libfprint (goodixtls5125 only) + the capture tool, into ./build
++set -euo pipefail
++cd "$(dirname "$0")/.."
++# Optional: point PATH/PKG_CONFIG_PATH at newer meson/deps if your distro is too old.
++if [[ ! -d build ]]; then
++  meson setup build -Ddrivers=goodixtls5125 -Dintrospection=false -Ddoc=false \
++    -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled \
++    -Dprefix=/usr -Dlibdir=lib -Dgtk-examples=false
++fi
++ninja -C build
++gcc -O2 -Wall -o build/g5125-capture tools/g5125-capture.c -Ilibfprint -Ibuild/libfprint \
++  $(pkg-config --cflags glib-2.0 gio-2.0 gusb) -Lbuild/libfprint -lfprint-2 \
++  $(pkg-config --libs glib-2.0 gobject-2.0 gio-2.0)
+diff --git a/tools/capture-run.sh b/tools/capture-run.sh
+new file mode 100755
+index 0000000..38c76d0
+--- /dev/null
++++ b/tools/capture-run.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++# usage (root): capture-run.sh <set-name> <touches>
++# Captures 3-frame bursts per touch into /root/g5125-capture/<set-name>.
++set -euo pipefail
++proj=$(cd "$(dirname "$0")/.." && pwd)
++out=/root/g5125-capture/$1
++install -d -m700 /root/g5125-capture "$out"
++systemctl stop fprintd.service 2>/dev/null || true
++export GOODIX5125_PSK_FILE=/var/lib/fprint/goodix5125-materials/psk.bin
++export GOODIX5125_ENGINE_DLL=/usr/lib/libfprint-2/goodix5125/AlgoChicago.dll
++export GOODIX5125_CALIBRATION_FILE=/var/lib/fprint/goodix5125-materials/calibration.dat
++export GOODIX5125_BASELINE_FILE=/var/lib/fprint/goodix5125-materials/baseline.raw
++export GOODIX5125_CAPTURE_DIR=$out GOODIX5125_BURST=3
++export G_MESSAGES_DEBUG=libfprint-goodixtls5125
++export LD_LIBRARY_PATH=$proj/build/libfprint
++exec "$proj/build/g5125-capture" "${3:?print file required}" "$2"
+diff --git a/tools/g5125-capture.c b/tools/g5125-capture.c
+new file mode 100644
+index 0000000..b44701f
+--- /dev/null
++++ b/tools/g5125-capture.c
+@@ -0,0 +1,76 @@
++/* Touch-capture loop for the Goodix 27c6:5125 driver.
++ *
++ * Runs verify against one stored fprintd print, once per touch, and prints one
++ * line per result. With GOODIX5125_CAPTURE_DIR set, the driver also saves the
++ * raw frames of every touch. Needs the device to be free (stop fprintd).
++ *
++ * usage: g5125-capture <print-file> <touches>
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <fprint.h>
++
++static void
++on_match (FpDevice *dev, FpPrint *match, FpPrint *print, gpointer data, GError *error)
++{
++  if (error)
++    printf ("  retry: %s\n", error->message);
++}
++
++int
++main (int argc, char **argv)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(FpContext) ctx = NULL;
++  g_autofree gchar *blob = NULL;
++  gsize len = 0;
++  GPtrArray *devices;
++  FpDevice *dev;
++  FpPrint *enrolled;
++  int touches;
++
++  setvbuf (stdout, NULL, _IOLBF, 0);
++  if (argc != 3)
++    {
++      fprintf (stderr, "usage: %s <print-file> <touches>\n", argv[0]);
++      return 2;
++    }
++  touches = atoi (argv[2]);
++  if (!g_file_get_contents (argv[1], &blob, &len, &error) ||
++      !(enrolled = fp_print_deserialize ((guchar *) blob, len, &error)))
++    {
++      fprintf (stderr, "print: %s\n", error->message);
++      return 1;
++    }
++
++  ctx = fp_context_new ();
++  devices = fp_context_get_devices (ctx);
++  if (!devices || devices->len == 0)
++    {
++      fprintf (stderr, "no fingerprint device\n");
++      return 1;
++    }
++  dev = g_ptr_array_index (devices, 0);
++  if (!fp_device_open_sync (dev, NULL, &error))
++    {
++      fprintf (stderr, "open: %s\n", error->message);
++      return 1;
++    }
++
++  for (int i = 1; i <= touches; i++)
++    {
++      gboolean match = FALSE;
++
++      printf ("READY %d\n", i);
++      if (!fp_device_verify_sync (dev, enrolled, NULL, on_match, NULL, &match, NULL, &error))
++        {
++          printf ("TOUCH %d error: %s\n", i, error->message);
++          g_clear_error (&error);
++          continue;
++        }
++      printf ("TOUCH %d %s\n", i, match ? "MATCH" : "no-match");
++    }
++
++  fp_device_close_sync (dev, NULL, NULL);
++  return 0;
++}
+diff --git a/tools/g5125-eval.c b/tools/g5125-eval.c
+new file mode 100644
+index 0000000..f1127b2
+--- /dev/null
++++ b/tools/g5125-eval.c
+@@ -0,0 +1,222 @@
++/* Offline evaluation of Goodix 27c6:5125 matching on captured touches.
++ *
++ * usage: g5125-eval <engine.dll> <calibration> <baseline> <capture-dir> [old-print]
++ * capture-dir holds enroll/, casual/, other/ with t<NNN>-f<k>.raw frames.
++ * Enrolls templates from the "enroll" touches under several settings and
++ * reports casual-touch acceptance and other-finger false accepts.
++ */
++#include "../libfprint/drivers/goodixtls/goodix_engine.c"
++#include "../libfprint/drivers/goodixtls/goodix5125_calib.c"
++#include <fprint.h>
++
++#define MAXT 64
++#define NF 3
++
++typedef struct {
++  int n;                          /* touches */
++  guint8 prep[MAXT][NF][5120];
++  gboolean ok[MAXT][NF];
++  guint q[MAXT][NF];
++} Set;
++
++static void
++load_set (const char *dir, const char *name, Set *s)
++{
++  memset (s, 0, sizeof *s);
++  for (int t = 1; t <= MAXT; t++)
++    {
++      gboolean any = FALSE;
++      for (int f = 0; f < NF; f++)
++        {
++          g_autofree gchar *p = g_strdup_printf ("%s/%s/t%03d-f%d.raw", dir, name, t, f);
++          g_autofree gchar *raw = NULL;
++          gsize len = 0;
++          guint c = 0;
++          if (!g_file_get_contents (p, &raw, &len, NULL) || len != 10240)
++            continue;
++          any = TRUE;
++          s->ok[t - 1][f] = goodix_engine_native_prepare ((const guint16 *) raw,
++                                                          s->prep[t - 1][f], &s->q[t - 1][f], &c);
++        }
++      if (!any)
++        break;
++      s->n = t;
++    }
++  printf ("%s: %d touches\n", name, s->n);
++}
++
++/* Enroll from a list of (set, touch, frame) samples, up to target images. */
++typedef struct { Set *s; int t, f; } Sample;
++
++static int
++enroll (Sample *samples, int n, int target, guint8 **blob, size_t *len, int *used)
++{
++  int max_imgs = 32;
++  g_rec_mutex_lock (&g_milan_mutex);
++  ensure_gs ();
++  void *ctx = m_enrolStartEx (&max_imgs);
++  *(u16 *) ((char *) ctx + 8) = target;
++  g_rec_mutex_unlock (&g_milan_mutex);
++  *used = 0;
++  int count = 0, progress = 0;
++  for (int i = 0; i < n && count < target; i++)
++    {
++      Sample *x = &samples[i];
++      if (!x->s->ok[x->t][x->f])
++        continue;
++      int r = goodix_engine_enroll_add_image (ctx, x->s->prep[x->t][x->f], 80, 64, &count, &progress);
++      if (r == 0)
++        (*used)++;
++    }
++  int rc = goodix_engine_enroll_commit (ctx, blob, len);
++  goodix_engine_enroll_finish (ctx);
++  return rc ? -1 : count;
++}
++
++/* Best score of one touch against a gallery, using the first k frames. */
++static int
++touch_score (Set *s, int t, int k, guint8 **blobs, size_t *lens, int nb)
++{
++  int best = 0;
++  for (int f = 0; f < k; f++)
++    {
++      if (!s->ok[t][f])
++        continue;
++      for (int b = 0; b < nb; b++)
++        {
++          int score = 0;
++          goodix_engine_verify_image (s->prep[t][f], 80, 64, blobs[b], lens[b], &score);
++          best = MAX (best, score);
++        }
++    }
++  return best;
++}
++
++static void
++report (const char *label, Set *gen, int gen_from, Set *imp, guint8 **blobs, size_t *lens, int nb)
++{
++  printf ("%-44s", label);
++  for (int k = 1; k <= NF; k++)
++    {
++      int acc30 = 0, acc20 = 0, n = 0;
++      for (int t = gen_from; t < gen->n; t++, n++)
++        {
++          int sc = touch_score (gen, t, k, blobs, lens, nb);
++          acc30 += sc >= 30;
++          acc20 += sc >= 20;
++        }
++      printf (" k=%d %2d/%d (%2d@20)", k, acc30, n, acc20);
++    }
++  int fa = 0, maxi = 0;
++  for (int t = 0; t < imp->n; t++)
++    {
++      int sc = touch_score (imp, t, NF, blobs, lens, nb);
++      fa += sc >= 20;
++      maxi = MAX (maxi, sc);
++    }
++  printf ("  impostor max %d, FA@20 %d/%d\n", maxi, fa, imp->n);
++}
++
++int
++main (int argc, char **argv)
++{
++  GError *error = NULL;
++  static Set en, ca, ot;
++  setvbuf (stdout, NULL, _IOLBF, 0);
++  if (argc < 5 || !goodix_engine_init (argv[1], &error) ||
++      !goodix_engine_native_preprocess_init (argv[2], argv[3], &error))
++    {
++      fprintf (stderr, "init: %s\n", error ? error->message : "usage");
++      return 1;
++    }
++  load_set (argv[4], "enroll", &en);
++  load_set (argv[4], "casual", &ca);
++  load_set (argv[4], "other", &ot);
++
++  guint8 *blobs[8];
++  size_t lens[8];
++  guint8 *oldb = NULL; size_t oldl = 0;
++  int nb = 0;
++
++  /* Old print (Oct 1 live enrollment) as the baseline. */
++  if (argc > 5)
++    {
++      g_autofree gchar *data = NULL;
++      gsize dlen = 0;
++      FpPrint *p;
++      g_autoptr(GVariant) v = NULL;
++      const guint8 *b;
++      gsize bl;
++      if (g_file_get_contents (argv[5], &data, &dlen, NULL) &&
++          (p = fp_print_deserialize ((guchar *) data, dlen, &error)))
++        {
++          g_object_get (p, "fpi-data", &v, NULL);
++          if (g5125_template_from_variant (v, &b, &bl))
++            {
++              oldb = g_memdup2 (b, bl);
++              oldl = bl;
++              report ("old Oct-1 print", &ca, 0, &ot, &oldb, &oldl, 1);
++            }
++        }
++    }
++
++  Sample s[3 * MAXT];
++  int ns, used;
++  /* samples: 20 deliberate (frame 0) + casual 1-12 (frame 0); test casual 13-40 */
++  ns = 0;
++  for (int t = 0; t < en.n; t++) s[ns++] = (Sample) { &en, t, 0 };
++  for (int t = 0; t < 12; t++) s[ns++] = (Sample) { &ca, t, 0 };
++  int splits[] = { 1, 2 };
++  for (int with_old = 0; with_old <= (argc > 5); with_old++)
++    for (int i = 0; i < 2; i++)
++      {
++        int k = splits[i], per = (ns + k - 1) / k;
++        nb = 0;
++        for (int j = 0; j < k; j++)
++          {
++            int from = j * per, n = MIN (per, ns - from);
++            enroll (s + from, n, n, &blobs[nb], &lens[nb], &used);
++            nb++;
++          }
++        guint8 *g[6]; size_t gl[6];
++        for (int j = 0; j < nb; j++) { g[j] = blobs[j]; gl[j] = lens[j]; }
++        if (with_old) { g[nb] = oldb; gl[nb] = oldl; }
++        g_autofree gchar *lab = g_strdup_printf ("32 touches in %d template(s)%s [13-40]", k, with_old ? " + old" : "");
++        report (lab, &ca, 12, &ot, g, gl, nb + with_old);
++        for (int j = 0; j < nb; j++) free (blobs[j]);
++      }
++  /* 24 deliberate-style touches only (what a live enrollment gives): enroll set only */
++  ns = 0;
++  for (int t = 0; t < en.n; t++) s[ns++] = (Sample) { &en, t, 0 };
++  for (int k = 1; k <= 2; k++)
++    {
++      int per = (ns + k - 1) / k;
++      nb = 0;
++      for (int j = 0; j < k; j++)
++        {
++          int from = j * per, n = MIN (per, ns - from);
++          enroll (s + from, n, n, &blobs[nb], &lens[nb], &used);
++          nb++;
++        }
++      g_autofree gchar *lab = g_strdup_printf ("20 deliberate in %d template(s) [1-40]", k);
++      report (lab, &ca, 0, &ot, blobs, lens, nb);
++      for (int j = 0; j < nb; j++) free (blobs[j]);
++    }
++
++  /* capacity: all 60 right-index touches today in one template */
++  {
++    Sample all[3 * MAXT]; int na = 0, used2 = 0;
++    for (int t = 0; t < en.n; t++) all[na++] = (Sample) { &en, t, 0 };
++    for (int t = 0; t < ca.n; t++) all[na++] = (Sample) { &ca, t, 0 };
++    int cnt = enroll (all, na, na, &blobs[0], &lens[0], &used2);
++    gint64 t0 = g_get_monotonic_time ();
++    int sc = 0;
++    for (int r = 0; r < 20; r++) goodix_engine_verify_image (ot.prep[0][0], 80, 64, blobs[0], lens[0], &sc);
++    printf ("capacity: %d samples -> count %d, accepted %d, template %zu B, verify %.1f ms\n",
++            na, cnt, used2, lens[0], (g_get_monotonic_time () - t0) / 20000.0);
++    guint8 *g2[2] = { blobs[0], oldb }; size_t l2[2] = { lens[0], oldl };
++    report ("60 today + old (contaminated, all casual)", &ca, 0, &ot, g2, l2, oldb ? 2 : 1);
++    free (blobs[0]);
++  }
++  return 0;
++}
+-- 
+2.56.0
+

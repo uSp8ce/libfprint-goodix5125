@@ -1,0 +1,67 @@
+# Local package for the Goodix 27c6:5125 reader (Huawei MateBook BOM-WXX9).
+# Source: arbnorme/libfprint-goodix5125 at c3bd02b + the patches in this
+# directory (exported from the goodix5125 branch with git format-patch).
+# The Goodix matching engine is taken from Goodix's own Windows driver
+# package on the Microsoft Update Catalog and checked by hash; it is
+# proprietary and stays a local install.
+
+pkgname=libfprint-goodix5125
+_commit=c3bd02b6ed010903126eed623f35217e5f215958
+pkgver=1.94.100.g5125.5
+pkgrel=1
+pkgdesc='libfprint with the Goodix 27c6:5125 driver (matching via the Goodix engine)'
+arch=('x86_64')
+url='https://github.com/arbnorme/libfprint-goodix5125'
+license=('LGPL-2.1-or-later' 'LicenseRef-Goodix-proprietary')
+depends=('glib2' 'libgusb' 'openssl')
+makedepends=('git' 'meson' 'ninja' 'glib2-devel')
+provides=('libfprint=1.94.100' 'libfprint-2.so=2-64')
+conflicts=('libfprint' 'libfprint-goodix5125-local')
+replaces=('libfprint-goodix5125-local')
+options=('!lto')
+source=("libfprint-goodix5125::git+https://github.com/arbnorme/libfprint-goodix5125.git#commit=${_commit}"
+        'goodix-fp-1.1.125.20.cab::https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2022/05/5f2cfe33-8430-4d88-a654-de241785f4dd_3032d6cda11d2be4d1a2f1fee770db85fe60442e.cab'
+        '0001-Local-rev4-fixes-12508-frame-layout-12-arg-identifyI.patch'
+        '0002-goodixtls5125-read-up-to-3-frames-per-touch-20-touch.patch'
+        '0003-goodixtls5125-default-material-paths-under-var-lib-f.patch'
+        '0004-goodixtls5125-take-the-touch-at-once-when-a-finger-i.patch'
+        '0005-goodixtls-20-ms-TLS-flight-quiet-time-instead-of-200.patch')
+noextract=('goodix-fp-1.1.125.20.cab')
+sha256sums=('SKIP'
+            'd2d6674b6b3b17a4632a28754461db1d17bc65e7c736e14a3cf08e1a737cf11b'
+            'c8662fcbfd46f734540f4170f17f97bac7fc43696fa36e1ab7d802281819618f'
+            'd35a5b97e9219efcca6606332787c772003e16848a689ea22f019be96eee9acb'
+            'bb0bd38a651fbb36ec6960b359e03edd1cf66f6049b95ac4f781dd56e579ce5a'
+            'b5c3552a2cbfafeda8c342efd36d1a234a63406321ddedb663c8a7c52513613f'
+            'd670cfe5fcca5774f535de844990316b99033ba79597e758217105b38f87387c')
+
+prepare() {
+  cd libfprint-goodix5125
+  for p in "$srcdir"/0*.patch; do
+    git apply "$p"
+  done
+  bsdtar -xf "$srcdir/goodix-fp-1.1.125.20.cab" -C "$srcdir" AlgoChicago.dll
+  echo '21197244f4e709f4015efb56e429df19b534b82f6002dbf10d601467468f4ba3  '"$srcdir"'/AlgoChicago.dll' | sha256sum -c
+}
+
+build() {
+  arch-meson libfprint-goodix5125 build \
+    -Ddrivers=goodixtls5125 \
+    -Dintrospection=false \
+    -Ddoc=false \
+    -Dinstalled-tests=false \
+    -Dudev_rules=disabled \
+    -Dudev_hwdb=disabled \
+    -Dgtk-examples=false
+  meson compile -C build
+}
+
+check() {
+  GOODIX5125_ENGINE_DLL="$srcdir/AlgoChicago.dll" \
+    meson test -C build --print-errorlogs goodix5125-calib goodix5125-engine
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 "$srcdir/AlgoChicago.dll" "$pkgdir/usr/lib/libfprint-2/goodix5125/AlgoChicago.dll"
+}

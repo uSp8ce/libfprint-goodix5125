@@ -67,7 +67,30 @@ struct _FpiDeviceGoodixTls5125
   guint              burst_idx;
   guint              frames_ok;
   gint               best_score;
+
+  /* Finger already on the sensor while the action activates: the FDT
+   * baseline would then be the finger-present level, so the touch is taken
+   * straight away instead of waiting for a finger-down event. */
+  gboolean           frame_check_finger;
+  gboolean           finger_at_start;
+  guint16            empty_raw[G5125_CHANNELS];
+  gboolean           have_empty_raw;
 };
+
+/* FDT channel readings drop by 0x50-0x90 with a finger on the sensor. */
+#define G5125_PRESSED_DROP     0x20
+#define G5125_PRESSED_CHANNELS 3
+
+static gboolean
+fdt_looks_pressed (const guint16 raw[G5125_CHANNELS], const guint16 empty[G5125_CHANNELS])
+{
+  guint n = 0;
+
+  for (int c = 0; c < G5125_CHANNELS; c++)
+    if (raw[c] + G5125_PRESSED_DROP < empty[c])
+      n++;
+  return n >= G5125_PRESSED_CHANNELS;
+}
 
 /* Frames read per touch for verify/identify. GOODIX5125_BURST overrides. */
 #define G5125_BURST_DEFAULT 3
@@ -209,6 +232,7 @@ on_frame_check (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
       return;
     }
   fp_info ("Native image validated: %u bytes, 5120 pixels, CRC correct", length);
+  FPI_DEVICE_GOODIXTLS5125 (dev)->frame_check_finger = FALSE;
   GError *prep_error = NULL;
   const char *calib = g_getenv ("GOODIX5125_CALIBRATION_FILE");
   const char *baseline = g_getenv ("GOODIX5125_BASELINE_FILE");
@@ -224,6 +248,15 @@ on_frame_check (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
       fpi_ssm_mark_failed (ssm, prep_error);
       return;
     }
+  {
+    FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+    guint8 prep[G5125_PIXELS];
+    guint q = 0, c = 0;
+
+    self->frame_check_finger = goodix_engine_native_prepare (pix, prep, &q, &c);
+    fp_dbg ("Activation frame: quality %u coverage %u finger %d", q, c,
+            self->frame_check_finger);
+  }
   fpi_ssm_next_state (ssm);
 }
 
@@ -360,6 +393,24 @@ on_fdt_measured (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
   fp_dbg ("FDT channels %03x %03x %03x %03x %03x %03x",
           raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
   self->soft_errors = 0;
+  {
+    gboolean pressed = self->have_empty_raw && fdt_looks_pressed (raw, self->empty_raw);
+
+    if (ssm == self->act_ssm && (pressed || self->frame_check_finger))
+      {
+        /* finger is down now: arm finger-up from this level after the touch */
+        fp_dbg ("Finger on the sensor during activation (frame %d, fdt %d)",
+                self->frame_check_finger, pressed);
+        self->finger_at_start = TRUE;
+        if (!g5125_fdt_base (raw, self->up_base))
+          memcpy (self->up_base, self->base, sizeof self->up_base);
+      }
+    else if (!pressed)
+      {
+        memcpy (self->empty_raw, raw, sizeof self->empty_raw);
+        self->have_empty_raw = TRUE;
+      }
+  }
   fpi_ssm_next_state (ssm);
 }
 
@@ -809,6 +860,12 @@ scan_ssm_run (FpiSsm *ssm, FpDevice *dev)
           fpi_ssm_jump_to_state (ssm, SCAN_TLS_RECONNECT);
           return;
         }
+      if (self->finger_at_start)
+        {
+          self->finger_at_start = FALSE;
+          fpi_ssm_jump_to_state (ssm, SCAN_GET_IMAGE);
+          return;
+        }
       measure_fdt (dev, ssm, self->base);
       break;
 
@@ -1029,6 +1086,8 @@ start_action (FpDevice *dev, G5125Action action)
   FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
 
   self->action = action;
+  self->finger_at_start = FALSE;
+  self->frame_check_finger = FALSE;
   self->enroll_stage = 0;
   self->enroll_progress = 0;
   self->result = FPI_MATCH_FAIL;

@@ -21,6 +21,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <glib.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
@@ -31,6 +33,8 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "drivers_api.h"
 #include "fp-device.h"
@@ -64,9 +68,10 @@ tls_server_psk_server_callback (SSL           *ssl,
       return 0;
     }
 
-  // zero out the psk
-  for (int n = 0; n != len; ++n)
-    psk[n] = 0;
+  GoodixTlsServer *self = SSL_get_app_data (ssl);
+  if (!self)
+    return 0;
+  memcpy (psk, self->psk, len);
 
   return len;
 }
@@ -197,6 +202,7 @@ goodix_tls_server_deinit (GoodixTlsServer *self, GError **error)
 
   SSL_CTX_free (self->ssl_ctx);
   pthread_join (self->serve_thread, NULL);
+  OPENSSL_cleanse (self->psk, sizeof self->psk);
 
   return TRUE;
 }
@@ -204,6 +210,37 @@ goodix_tls_server_deinit (GoodixTlsServer *self, GError **error)
 gboolean
 goodix_tls_server_init (GoodixTlsServer *self, GError **error)
 {
+  memset (self->psk, 0, sizeof self->psk);
+  const char *key_path = g_getenv ("GOODIX5125_PSK_FILE");
+  if (key_path && *key_path)
+    {
+      int fd = open (key_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      struct stat st;
+      gboolean valid = fd >= 0 && fstat (fd, &st) == 0 &&
+                       S_ISREG (st.st_mode) && st.st_size == sizeof self->psk &&
+                       (st.st_mode & 0077) == 0 &&
+                       (st.st_uid == geteuid () || st.st_uid == 0);
+      gsize offset = 0;
+      while (valid && offset < sizeof self->psk)
+        {
+          ssize_t n = read (fd, self->psk + offset, sizeof self->psk - offset);
+          if (n < 0 && errno == EINTR)
+            continue;
+          if (n <= 0)
+            valid = FALSE;
+          else
+            offset += n;
+        }
+      if (fd >= 0)
+        close (fd);
+      if (!valid)
+        {
+          OPENSSL_cleanse (self->psk, sizeof self->psk);
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                       "Goodix key file must be a private 32-byte regular file");
+          return FALSE;
+        }
+    }
   SSL_load_error_strings ();
   OpenSSL_add_ssl_algorithms ();
   SSL_library_init ();
@@ -230,6 +267,7 @@ goodix_tls_server_init (GoodixTlsServer *self, GError **error)
       return FALSE;
     }
   self->ssl_layer = SSL_new (self->ssl_ctx);
+  SSL_set_app_data (self->ssl_layer, self);
   tls_config_ssl (self->ssl_layer);
   SSL_set_fd (self->ssl_layer, self->sock_fd);
 

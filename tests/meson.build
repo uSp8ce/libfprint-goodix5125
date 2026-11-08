@@ -292,7 +292,7 @@ else
         args: ['-c', 'exit 77']
     )
 
-    foreach driver_test: drivers_tests
+    foreach driver_test, unused_test_description: drivers_tests
         test(driver_test,
             sh,
             args: ['-c', 'exit 77']

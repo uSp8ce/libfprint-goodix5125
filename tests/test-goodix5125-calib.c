@@ -215,6 +215,54 @@ pack4 (const guint16 p[4], guint8 d[6])
 }
 
 static void
+test_decode_native_image (void)
+{
+  guint8 plain[G5125_NATIVE_PLAIN_LEN] = {0};
+  guint16 raw[G5125_PIXELS], pix[G5125_PIXELS];
+  /* Fixed CRC independently calculated for this complete synthetic frame. */
+  const guint32 crc = 0xf141c815;
+  guint8 *tail = plain + 8 + G5125_PIXELS / 4 * 6;
+
+  for (int i = 0; i < G5125_PIXELS; i++)
+    raw[i] = (i * 17 + 29) & 0xfff;
+  for (int i = 0; i < G5125_PIXELS / 4; i++)
+    pack4 (raw + 4 * i, plain + 8 + 6 * i);
+  tail[0] = (crc >> 8) & 0xff;
+  tail[1] = crc & 0xff;
+  tail[2] = crc >> 24;
+  tail[3] = (crc >> 16) & 0xff;
+  g_assert_true (g5125_decode_image (plain, sizeof plain, pix));
+  g_assert_cmpmem (pix, sizeof pix, raw, sizeof raw);
+  plain[2000] ^= 1;
+  g_assert_false (g5125_decode_image (plain, sizeof plain, pix));
+  plain[2000] ^= 1;
+  tail[3] ^= 1;
+  g_assert_false (g5125_decode_image (plain, sizeof plain, pix));
+  g_assert_false (g5125_decode_image (plain, sizeof plain - 1, pix));
+}
+
+static void
+test_native_config (void)
+{
+  G5125Calib c;
+  guint8 cfg[224];
+  memcpy (cfg, g5125_config_12508, sizeof cfg);
+  g5125_calib_from_otp (otp, &c);
+  g_assert_cmpuint (g5125_config_patch (cfg, sizeof cfg, &c), ==, 6);
+  /* Section zero: tcode and all four sensor DACs must survive upload. */
+  g_assert_cmpuint (cfg[115] | cfg[116] << 8, ==, 0x00b0);
+  g_assert_cmpuint (cfg[119] | cfg[120] << 8, ==, 0x0b08);
+  g_assert_cmpuint (cfg[123] | cfg[124] << 8, ==, 0x00b3);
+  g_assert_cmpuint (cfg[127] | cfg[128] << 8, ==, 0x00b1);
+  g_assert_cmpuint (cfg[131] | cfg[132] << 8, ==, 0x00b2);
+  /* Section two: change the detection delta's high byte only. */
+  g_assert_cmpuint (cfg[175] | cfg[176] << 8, ==, 0x3080);
+  g_assert_cmpuint (cfg[151] | cfg[152] << 8, ==, 0x0100);
+  g_assert_cmpuint (cfg[222] | cfg[223] << 8, ==,
+                    g5125_config_checksum (cfg, sizeof cfg));
+}
+
+static void
 test_decode_image_bit_layout (void)
 {
   g_autofree guint8 *plain = g_malloc0 (G5125_IMAGE_PLAIN_LEN);
@@ -389,7 +437,7 @@ test_template_rejects_bad_data (void)
   g_autoptr(GVariant) unversioned = g_variant_ref_sink (
     g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, sizeof blob, 1));
   g_autoptr(GVariant) v2 = g_variant_ref_sink (
-    g_variant_new ("(y@ay)", 2, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, sizeof blob, 1)));
+    g_variant_new ("(y@ay)", 1, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, sizeof blob, 1)));
   g_autoptr(GVariant) empty = g_variant_ref_sink (
     g_variant_new ("(y@ay)", G5125_TEMPLATE_VERSION, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, 0, 1)));
 
@@ -403,6 +451,8 @@ int
 main (int argc, char *argv[])
 {
   g_test_init (&argc, &argv, NULL);
+  g_test_add_func ("/goodix5125/image/native-crc", test_decode_native_image);
+  g_test_add_func ("/goodix5125/config/native", test_native_config);
   g_test_add_func ("/goodix5125/otp/check-ok", test_otp_check_ok);
   g_test_add_func ("/goodix5125/otp/check-corrupt", test_otp_check_detects_corruption);
   g_test_add_func ("/goodix5125/otp/check-short", test_otp_check_short);

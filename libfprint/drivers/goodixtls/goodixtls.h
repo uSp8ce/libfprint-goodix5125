@@ -44,6 +44,7 @@ typedef struct _GoodixTlsServer
   int       client_fd;
 
   pthread_t serve_thread;
+  guint8    psk[32];
 } GoodixTlsServer;
 
 /**

@@ -43,6 +43,7 @@ typedef struct
   GSource            *timeout;
 
   guint8              cmd;
+  guint8              image_cmd;
 
   gboolean            ack;
   gboolean            reply;
@@ -654,11 +655,21 @@ goodix_send_nop (FpDevice *dev, GoodixNoneCallback callback,
 }
 
 void
+goodix_set_image_command (FpDevice *dev, guint8 command)
+{
+  FpiDeviceGoodixTlsPrivate *priv =
+    fpi_device_goodixtls_get_instance_private (FPI_DEVICE_GOODIXTLS (dev));
+  priv->image_cmd = command;
+}
+
+void
 goodix_send_mcu_get_image (FpDevice *dev, GoodixImageCallback callback,
                            gpointer user_data)
 {
   GoodixDefault payload = {.unused_flags = 0x01};
   GoodixCallbackInfo *cb_info;
+  FpiDeviceGoodixTlsPrivate *priv =
+    fpi_device_goodixtls_get_instance_private (FPI_DEVICE_GOODIXTLS (dev));
 
   if (callback)
     {
@@ -667,13 +678,13 @@ goodix_send_mcu_get_image (FpDevice *dev, GoodixImageCallback callback,
       cb_info->callback = G_CALLBACK (callback);
       cb_info->user_data = user_data;
 
-      goodix_send_protocol (dev, FPI_DEVICE_GOODIXTLS_GET_CLASS (dev)->get_image_cmd, (guint8 *) &payload,
+      goodix_send_protocol (dev, priv->image_cmd, (guint8 *) &payload,
                             sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
                             goodix_receive_default, cb_info);
       return;
     }
 
-  goodix_send_protocol (dev, FPI_DEVICE_GOODIXTLS_GET_CLASS (dev)->get_image_cmd, (guint8 *) &payload,
+  goodix_send_protocol (dev, priv->image_cmd, (guint8 *) &payload,
                         sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
                         NULL, NULL);
 }
@@ -1185,10 +1196,13 @@ goodix_dev_init (FpDevice *dev, GError **error)
   priv->user_data = NULL;
   priv->data = NULL;
   priv->length = 0;
+  priv->image_cmd = class->get_image_cmd;
   priv->transfer_cancel_tkn = g_cancellable_new ();
 
   return g_usb_device_claim_interface (fpi_device_get_usb_device (dev),
-                                       class->interface, 0, error);
+                                       class->interface,
+                                       G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER,
+                                       error);
 }
 void
 goodix_reset_state (FpDevice *dev)
@@ -1223,7 +1237,9 @@ goodix_dev_deinit (FpDevice *dev, GError **error)
   priv->inited = FALSE;
 
   return g_usb_device_release_interface (fpi_device_get_usb_device (dev),
-                                         class->interface, 0, error);
+                                         class->interface,
+                                         G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER,
+                                         error);
 }
 
 // ---- DEV SECTION END ----

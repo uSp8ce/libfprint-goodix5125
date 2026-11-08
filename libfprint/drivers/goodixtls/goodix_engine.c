@@ -36,6 +36,7 @@
 #include <time.h>
 #include <math.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <asm/prctl.h>
@@ -185,6 +186,15 @@ static void* MS sh_GetCurrentProcess(void) { return (void*)-1; }
 static u32  MS sh_GetCurrentProcessId(void) { return 1234; }
 static u32  MS sh_GetCurrentThreadId(void) { return 5678; }
 static void* MS sh_GetModuleHandleW(void *n) { return (void*)g_image; }
+static u32 MS sh_GetModuleFileNameA(void *module, char *out, u32 size) {
+    const char *name = "C:\\Windows\\System32\\AlgoChicago.dll";
+    size_t length = strlen(name);
+    (void)module;
+    if (!out || size == 0) { g_lasterr = 87; return 0; }
+    if (length >= size) { memcpy(out, name, size - 1); out[size - 1] = 0; g_lasterr = 122; return size; }
+    memcpy(out, name, length + 1);
+    return (u32)length;
+}
 static void* MS sh_CreateThread(void *sa, u64 st, void *fn, void *arg, u32 fl, u32 *id) {
     if (id) *id = 4321;
     return (void*)0x3000;
@@ -635,6 +645,7 @@ static void register_all_shims(void) {
     reg_name("EncodePointer", sh_EncodePointer);
     reg_name("GetStartupInfoW", sh_GetStartupInfoW);
     reg_name("GetModuleHandleW", sh_GetModuleHandleW);
+    reg_name("GetModuleFileNameA", sh_GetModuleFileNameA);
     reg_name("GetSystemDirectoryW", sh_GetSystemDirectoryW);
     reg_name("GetDiskFreeSpaceExW", sh_GetDiskFreeSpaceExW);
     reg_name("OutputDebugStringW", sh_OutputDebugStringW);
@@ -1037,7 +1048,10 @@ static int (MS *m_templateGetPackedSize)(void*) = NULL;
 static int (MS *m_templatePack)(void*, void*) = NULL;
 static int (MS *m_templateUnPack)(const void*, int, void*, void**) = NULL;
 static int (MS *m_templateDelete)(void*) = NULL;
-static int (MS *m_identifyImage)(GoodixImage*, void*, void**, int, int*, int*, u32*, int, int, void*, int) = NULL;
+/* Both checked Milan_v_3.02.00.15 DLLs take twelve arguments. The last
+ * byte requests construction of a fresh probe feature. Omitting it makes the
+ * DLL read an unspecified stack byte and may reuse stale global probe state. */
+static int (MS *m_identifyImage)(GoodixImage*, void*, void**, int, int*, int*, u32*, int, u8, void*, u8, u8) = NULL;
 /* Optional native quality export: without it, frame selection uses
  * residual range and active area instead of failing engine init. */
 static int (MS *m_getQuality)(GoodixImage*, u32*) = NULL;
@@ -1117,6 +1131,134 @@ gboolean goodix_engine_init (const char *dll_path, GError **error) {
     return TRUE;
 }
 
+/* Factory ChicagoHS preprocessing. Material files remain private and local. */
+static gboolean native_preprocess_ready;
+static guint8 native_calibration[140480];
+static guint16 native_baseline[5120];
+static guint8 native_scratch1[0x8000], native_scratch2[0x8000];
+static int (MS *native_process)(void*, void*, void*, void*, void*, u8, u8);
+
+static gboolean
+read_private_material (const char *path, void *buffer, size_t size, GError **error)
+{
+    if (!path || path[0] != '/') {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "Chicago calibration/baseline path is missing");
+        return FALSE;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size != (off_t)size ||
+        (st.st_mode & 0077) || (st.st_uid != 0 && st.st_uid != geteuid())) {
+        if (fd >= 0) close(fd);
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "Chicago material must be a private regular file of the expected size");
+        return FALSE;
+    }
+    size_t have = 0;
+    while (have < size) {
+        ssize_t n = read(fd, (guint8*)buffer + have, size - have);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        have += n;
+    }
+    close(fd);
+    if (have != size) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Short Chicago material read");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Write potentially unaligned fields in the vendor's 64-byte ABI header. */
+static void native_u16(guint8 *p, unsigned offset, guint16 value) { memcpy(p + offset, &value, 2); }
+static void native_u32(guint8 *p, unsigned offset, guint32 value) { memcpy(p + offset, &value, 4); }
+static void native_ptr(guint8 *p, unsigned offset, void *value) { memcpy(p + offset, &value, sizeof value); }
+
+gboolean
+goodix_engine_native_preprocess_init (const char *calibration_path,
+                                      const char *baseline_path,
+                                      GError **error)
+{
+    g_rec_mutex_lock(&g_milan_mutex);
+    if (!g_milan_available) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_INITIALIZED,
+                            "Chicago matching engine is not initialized");
+        g_rec_mutex_unlock(&g_milan_mutex);
+        return FALSE;
+    }
+    int (MS *init_cal)(void) = get_export("preprocess_init_calidata");
+    unsigned (MS *cal_size)(void) = get_export("preprocess_get_calidata_len");
+    int (MS *load_cal)(void*, unsigned) = get_export("preprocess_load_calidata");
+    int (MS *init)(void*) = get_export("preprocessor_init");
+    int (MS *set_mode)(int) = get_export("preprocess_set_mode");
+    int (MS *finish)(void) = get_export("preprocessor_exit");
+    native_process = get_export("preprocessor");
+    gboolean success = FALSE;
+    ensure_gs();
+    if (native_preprocess_ready && finish) finish();
+    native_preprocess_ready = FALSE;
+    if (!g_milan_available || !init_cal || !cal_size || !load_cal || !init ||
+        !set_mode || !native_process || !finish) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                            "Chicago preprocessing exports are unavailable");
+        goto done;
+    }
+    if (!read_private_material(calibration_path, native_calibration, sizeof native_calibration, error) ||
+        !read_private_material(baseline_path, native_baseline, sizeof native_baseline, error))
+        goto done;
+    if (m_ppp_param_init(12) || init_cal() || cal_size() != 0x224b0 ||
+        load_cal(native_calibration + 16, 0x224b0)) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "Chicago rejected the calibration data");
+        goto done;
+    }
+    guint8 config[64] = {0};
+    native_ptr(config, 0x18, native_baseline);
+    native_u32(config, 0x24, 80);
+    native_u32(config, 0x28, 64);
+    int init_result = init(config);
+    int mode_result = init_result ? -1 : set_mode(1);
+    if (init_result || mode_result) {
+        if (!init_result) finish();
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Chicago preprocessing initialization failed");
+        goto done;
+    }
+    memset(native_scratch1, 0, sizeof native_scratch1);
+    memset(native_scratch2, 0, sizeof native_scratch2);
+    success = native_preprocess_ready = TRUE;
+ done:
+    g_rec_mutex_unlock(&g_milan_mutex);
+    return success;
+}
+
+gboolean
+goodix_engine_native_prepare (const guint16 stream[5120], guint8 enhanced[5120],
+                               guint *quality, guint *coverage)
+{
+    guint16 raw[5120];
+    guint8 input[64] = {0}, output[64] = {0}, qc[64] = {0};
+    *quality = *coverage = 0;
+    g_rec_mutex_lock(&g_milan_mutex);
+    if (!native_preprocess_ready) {
+        g_rec_mutex_unlock(&g_milan_mutex);
+        return FALSE;
+    }
+    ensure_gs();
+    /* ChicagoHUDataRegroup: 64-sample fast wire axis to 80-column image. */
+    for (unsigned i = 0; i < 5120; i++) raw[(i % 64) * 80 + i / 64] = stream[i];
+    memset(enhanced, 0, 5120);
+    native_ptr(input, 0, raw); native_u16(input, 8, 80); native_u16(input, 10, 64);
+    native_u32(input, 20, 10240); native_u16(input, 24, 1);
+    native_ptr(output, 0, enhanced); native_u16(output, 8, 80); native_u16(output, 10, 64);
+    native_u32(output, 20, 5120);
+    int result = native_process(input, native_scratch1, native_scratch2, output, qc, 0, 0);
+    *quality = output[40]; *coverage = output[41];
+    g_rec_mutex_unlock(&g_milan_mutex);
+    return result == 0 && *quality > 0 && *coverage > 0;
+}
+
 const char *goodix_engine_get_version (void) {
     return g_milan_version;
 }
@@ -1146,10 +1288,10 @@ guint goodix_engine_frame_quality (const uint8_t *pixels,
                                   guint *out_overlap) {
     if (out_quality) *out_quality = 0;
     if (out_overlap) *out_overlap = 0;
-    /* Engine geometry is fixed 64x80 (ppp_param_init(10)); anything else
+    /* Supported geometries are 64x80 (type 10) and 80x64 (type 12); anything else
      * falls back to the legacy proxy rather than feeding the engine a shape
      * it never saw in the ticket-72 shootout. */
-    if (!pixels || width != 64 || height != 80)
+    if (!pixels || !((width == 64 && height == 80) || (width == 80 && height == 64)))
         return 0;
     g_rec_mutex_lock (&g_milan_mutex);
     if (!g_milan_available || !m_getQuality) {
@@ -1159,7 +1301,7 @@ guint goodix_engine_frame_quality (const uint8_t *pixels,
     ensure_gs();
 
     GoodixImage img;
-    make_goodix_image(&img, pixels, width, height, 10);
+    make_goodix_image(&img, pixels, width, height, width == 80 ? 12 : 10);
     u32 qout[2] = {0};
     m_getQuality(&img, qout);
 
@@ -1193,12 +1335,12 @@ int goodix_engine_enroll_add_image (void *ctx,
                                    int height,
                                    int *enrolled_count,
                                    int *progress_pct) {
-    if (!ctx || !pixels || width != 64 || height != 80) return -1;
+    if (!ctx || !pixels || !((width == 64 && height == 80) || (width == 80 && height == 64))) return -1;
     g_rec_mutex_lock (&g_milan_mutex);
     ensure_gs();
 
     GoodixImage img;
-    make_goodix_image(&img, pixels, width, height, 10);
+    make_goodix_image(&img, pixels, width, height, width == 80 ? 12 : 10);
     u32 status_out[2] = {0};
 
     int add_res = m_enrolAddImage(ctx, &img, NULL, NULL, 0, status_out);
@@ -1267,7 +1409,7 @@ int goodix_engine_verify_image (const uint8_t *pixels,
                                size_t template_len,
                                int *out_score) {
     if (!pixels || !template_blob || template_len == 0) return 0;
-    if (width != 64 || height != 80) return 0;
+    if (!((width == 64 && height == 80) || (width == 80 && height == 64))) return 0;
     if (!g_milan_available) return 0;
     g_rec_mutex_lock (&g_milan_mutex);
     ensure_gs();
@@ -1281,7 +1423,7 @@ int goodix_engine_verify_image (const uint8_t *pixels,
     }
 
     GoodixImage probe;
-    make_goodix_image(&probe, pixels, width, height, 10);
+    make_goodix_image(&probe, pixels, width, height, width == 80 ? 12 : 10);
     void *active_templates[1] = { unpacked_template };
     int matched_idx = -999;
     int match_score = -999;
@@ -1289,12 +1431,13 @@ int goodix_engine_verify_image (const uint8_t *pixels,
 
     int id_res = m_identifyImage(&probe, NULL, active_templates, 1,
                                  &matched_idx, &match_score, details,
-                                 0, 0, NULL, 0);
-    (void)id_res;
+                                 0, 0, NULL, 0, 1);
+    g_debug ("goodix5125-engine: identify result=%d index=%d score=%d",
+             id_res, matched_idx, match_score);
 
     m_templateDelete(unpacked_template);
 
-    int is_match = (matched_idx == 0 && match_score > 0);
+    int is_match = (id_res == 0 && matched_idx == 0 && match_score > 0);
     if (out_score) *out_score = (match_score >= 0) ? match_score : 0;
     g_rec_mutex_unlock (&g_milan_mutex);
     return is_match;
@@ -1314,7 +1457,7 @@ int goodix_engine_identify_image (const uint8_t *pixels,
     if (out_score) *out_score = 0;
     if (!pixels || !template_blobs || !template_lens || n_templates <= 0)
         return 0;
-    if (width != 64 || height != 80)
+    if (!((width == 64 && height == 80) || (width == 80 && height == 64)))
         return 0;
     if (!g_milan_available) return 0;
     g_rec_mutex_lock (&g_milan_mutex);
@@ -1329,17 +1472,17 @@ int goodix_engine_identify_image (const uint8_t *pixels,
     }
 
     GoodixImage probe;
-    make_goodix_image(&probe, pixels, width, height, 10);
+    make_goodix_image(&probe, pixels, width, height, width == 80 ? 12 : 10);
     int matched_idx = -999, match_score = -999;
     u32 details[2] = {0};
-    m_identifyImage (&probe, NULL, unpacked, n_templates,
-                     &matched_idx, &match_score, details, 0, 0, NULL, 0);
+    int id_res = m_identifyImage (&probe, NULL, unpacked, n_templates,
+                                  &matched_idx, &match_score, details, 0, 0, NULL, 0, 1);
 
     for (int i = 0; i < n_templates; i++)
         if (unpacked[i]) m_templateDelete (unpacked[i]);
     g_free (unpacked);
 
-    int is_match = (matched_idx >= 0 && matched_idx < n_templates && match_score > 0);
+    int is_match = (id_res == 0 && matched_idx >= 0 && matched_idx < n_templates && match_score > 0);
     if (out_idx) *out_idx = is_match ? matched_idx : -1;
     if (out_score) *out_score = (match_score >= 0) ? match_score : 0;
     g_rec_mutex_unlock (&g_milan_mutex);

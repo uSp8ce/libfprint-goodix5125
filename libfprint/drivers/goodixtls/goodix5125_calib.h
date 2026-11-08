@@ -38,7 +38,10 @@
 #define G5125_IRQ_REVERSE2    0x0082
 #define G5125_ENGINE_GAIN     1.5f  /* high-pass gain the Goodix engine matches best with */
 #define G5125_MATCH_THRESHOLD 30    /* minimum engine score for a match */
-#define G5125_TEMPLATE_VERSION 1
+#define G5125_TEMPLATE_VERSION 3
+#define G5125_NATIVE_PLAIN_LEN (8 + G5125_PIXELS / 4 * 6 + 5)
+
+extern const guint8 g5125_config_12508[224];
 
 typedef struct
 {

@@ -43,6 +43,7 @@ struct _FpiDeviceGoodixTls5125
   FpiDeviceGoodixTls parent;
 
   G5125Calib         calib;
+  gboolean           native_12508;
   guint8             base[G5125_FDT_BASE_LEN];
   guint8             up_base[G5125_FDT_BASE_LEN];
   FpiSsm            *act_ssm;
@@ -112,6 +113,7 @@ enum activate_states {
   ACT_CONFIG,
   ACT_SCAN_FREQ,
   ACT_TLS,
+  ACT_FRAME_CHECK,
   ACT_FDT,
   ACT_NUM,
 };
@@ -140,7 +142,41 @@ on_firmware (FpDevice *dev, gchar *firmware, gpointer ssm, GError *error)
       fpi_ssm_mark_failed (ssm, error);
       return;
     }
-  fp_info ("Sensor firmware: %s", firmware);
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  self->native_12508 = g_strcmp0 (firmware, "GF_ST411SEC_APP_12508") == 0;
+  goodix_set_image_command (dev, self->native_12508 ? 0x20 : 0x22);
+  fp_info ("Sensor firmware: %s (native profile: %d)", firmware, self->native_12508);
+  fpi_ssm_next_state (ssm);
+}
+
+/* Validate the native frame layout immediately after establishing TLS. This
+ * catches a wrong acquisition profile before accepting enrollment samples. */
+static void
+on_frame_check (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+                GError *error)
+{
+  guint16 pix[G5125_PIXELS];
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+  if (length != G5125_NATIVE_PLAIN_LEN || !g5125_decode_image (data, length, pix))
+    {
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (
+                            FP_DEVICE_ERROR_PROTO,
+                            "Native image validation failed (length %u)", length));
+      return;
+    }
+  fp_info ("Native image validated: %u bytes, 5120 pixels, CRC correct", length);
+  GError *prep_error = NULL;
+  if (!goodix_engine_native_preprocess_init (g_getenv ("GOODIX5125_CALIBRATION_FILE"),
+                                              g_getenv ("GOODIX5125_BASELINE_FILE"),
+                                              &prep_error))
+    {
+      fpi_ssm_mark_failed (ssm, prep_error);
+      return;
+    }
   fpi_ssm_next_state (ssm);
 }
 
@@ -350,11 +386,13 @@ activate_ssm_run (FpiSsm *ssm, FpDevice *dev)
 
     case ACT_CONFIG:
       {
-        guint8 *cfg = g_memdup2 (default_config, sizeof default_config);
-        guint n = g5125_config_patch (cfg, sizeof default_config, &self->calib);
+        const guint8 *source = self->native_12508 ? g5125_config_12508 : default_config;
+        gsize len = self->native_12508 ? sizeof g5125_config_12508 : sizeof default_config;
+        guint8 *cfg = g_memdup2 (source, len);
+        guint n = g5125_config_patch (cfg, len, &self->calib);
 
         fp_dbg ("Patched %u config entries", n);
-        goodix_send_upload_config_mcu (dev, cfg, sizeof default_config, g_free,
+        goodix_send_upload_config_mcu (dev, cfg, len, g_free,
                                        on_success_step, ssm);
         break;
       }
@@ -365,6 +403,13 @@ activate_ssm_run (FpiSsm *ssm, FpDevice *dev)
 
     case ACT_TLS:
       goodix_tls_init (dev, on_none, ssm);
+      break;
+
+    case ACT_FRAME_CHECK:
+      if (self->native_12508)
+        goodix_tls_read_image (dev, on_frame_check, ssm);
+      else
+        fpi_ssm_next_state (ssm);
       break;
 
     case ACT_FDT:
@@ -485,7 +530,7 @@ on_finger_down (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
 
 /* Returns TRUE and the engine score if the frame matches the stored print. */
 static gboolean
-match_print (FpPrint *print, const guint8 *prep, gint *score, GError **error)
+match_print (FpPrint *print, const guint8 *prep, gint width, gint height, gint *score, GError **error)
 {
   g_autoptr(GVariant) data = NULL;
   const guint8 *blob;
@@ -499,7 +544,7 @@ match_print (FpPrint *print, const guint8 *prep, gint *score, GError **error)
       return FALSE;
     }
   *score = 0;
-  return goodix_engine_verify_image (prep, G5125_WIDTH, G5125_HEIGHT, blob, len, score) == 1 &&
+  return goodix_engine_verify_image (prep, width, height, blob, len, score) == 1 &&
          *score >= G5125_MATCH_THRESHOLD;
 }
 
@@ -509,15 +554,28 @@ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
   FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
   guint8 prep[G5125_PIXELS];
 
-  g5125_engine_prep (pix, prep);
+  gint width = self->native_12508 ? 80 : G5125_WIDTH;
+  gint height = self->native_12508 ? 64 : G5125_HEIGHT;
+  self->frame_rejected = FALSE;
+  if (self->native_12508)
+    {
+      guint quality = 0, coverage = 0;
+      self->frame_rejected = !goodix_engine_native_prepare (pix, prep, &quality, &coverage);
+      fp_dbg ("Factory preprocessing: quality %u coverage %u accepted %d",
+              quality, coverage, !self->frame_rejected);
+      if (self->frame_rejected)
+        return;
+    }
+  else
+    g5125_engine_prep (pix, prep);
 
   switch (self->action)
     {
     case G5125_ACTION_ENROLL:
       {
         gint enrolled = 0, progress = 0;
-        gint r = goodix_engine_enroll_add_image (self->enroll_ctx, prep, G5125_WIDTH,
-                                                 G5125_HEIGHT, &enrolled, &progress);
+        gint r = goodix_engine_enroll_add_image (self->enroll_ctx, prep, width,
+                                                 height, &enrolled, &progress);
 
         self->frame_rejected = (r != 0);
         if (!self->frame_rejected)
@@ -535,7 +593,7 @@ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
         gint score = 0;
 
         fpi_device_get_verify_data (dev, &print);
-        self->result = match_print (print, prep, &score, &self->result_error) ?
+        self->result = match_print (print, prep, width, height, &score, &self->result_error) ?
                        FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
         fp_dbg ("Verify: score %d (threshold %d)", score, G5125_MATCH_THRESHOLD);
         break;
@@ -553,7 +611,7 @@ handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
             g_autoptr(GError) err = NULL;
             gint score = 0;
 
-            if (match_print (g_ptr_array_index (prints, i), prep, &score, &err) && score > best)
+            if (match_print (g_ptr_array_index (prints, i), prep, width, height, &score, &err) && score > best)
               {
                 best = score;
                 self->identified = g_ptr_array_index (prints, i);
@@ -585,9 +643,11 @@ on_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
         fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
       return;
     }
-  if (!g5125_decode_image (data, length, pix))
+  fp_dbg ("Image frame length: %u", length);
+  if ((self->native_12508 && length != G5125_NATIVE_PLAIN_LEN) ||
+      !g5125_decode_image (data, length, pix))
     {
-      if (soft_error (self, ssm, "Image has unexpected length"))
+      if (soft_error (self, ssm, "Image length or CRC is invalid"))
         fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
       return;
     }
@@ -799,6 +859,13 @@ scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
 
     case G5125_ACTION_VERIFY:
+      if (self->frame_rejected)
+        {
+          fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                     fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+          start_scan (dev);
+          return;
+        }
       if (self->result_error)
         {
           GError *err = g_steal_pointer (&self->result_error);
@@ -812,6 +879,13 @@ scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
 
     case G5125_ACTION_IDENTIFY:
+      if (self->frame_rejected)
+        {
+          fpi_device_identify_report (dev, NULL, NULL,
+                                       fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+          start_scan (dev);
+          return;
+        }
       fpi_device_identify_report (dev, self->identified, NULL, NULL);
       action_cleanup (dev);
       fpi_device_identify_complete (dev, NULL);
@@ -931,6 +1005,30 @@ dev_open (FpDevice *dev)
     }
   fp_info ("Goodix engine %s loaded", goodix_engine_get_version ());
   goodix_dev_init (dev, &error);
+  if (!error)
+    {
+      GUsbDevice *usb = fpi_device_get_usb_device (dev);
+      guint8 coding[7] = { 0x00, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x08 };
+      gsize actual = 0;
+      /* This CDC reader drops bulk commands with DTR cleared. Reassert the
+       * ordinary 115200 8N1 + DTR/RTS setup after taking the interface. */
+      if (g_usb_device_control_transfer (usb, G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
+                                         G_USB_DEVICE_REQUEST_TYPE_CLASS,
+                                         G_USB_DEVICE_RECIPIENT_INTERFACE,
+                                         0x20, 0, 0, coding, sizeof coding,
+                                         &actual, 1000, NULL, &error))
+        g_usb_device_control_transfer (usb, G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
+                                       G_USB_DEVICE_REQUEST_TYPE_CLASS,
+                                       G_USB_DEVICE_RECIPIENT_INTERFACE,
+                                       0x22, 3, 0, NULL, 0, &actual, 1000,
+                                       NULL, &error);
+      if (error)
+        {
+          GError *close_error = NULL;
+          goodix_dev_deinit (dev, &close_error);
+          g_clear_error (&close_error);
+        }
+    }
   fpi_device_open_complete (dev, error);
 }
 

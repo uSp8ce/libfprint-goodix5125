@@ -277,6 +277,8 @@ void goodix_send_nop (FpDevice          *dev,
  * @param callback
  * @param user_data
  */
+void goodix_set_image_command (FpDevice *dev, guint8 command);
+
 void goodix_send_mcu_get_image (FpDevice           *dev,
                                 GoodixImageCallback callback,
                                 gpointer            user_data);

@@ -214,6 +214,18 @@ on_firmware (FpDevice *dev, gchar *firmware, gpointer ssm, GError *error)
 
 /* Validate the native frame layout immediately after establishing TLS. This
  * catches a wrong acquisition profile before accepting enrollment samples. */
+#define G5125_MCU_RESTART_INTERVAL (30 * G_USEC_PER_SEC)
+static gint64 g5125_last_mcu_restart;
+
+static void
+on_mcu_restart_sent (FpDevice *dev, gpointer ssm, GError *error)
+{
+  g_clear_error (&error);
+  fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (
+                         FP_DEVICE_ERROR_PROTO,
+                         "Sensor sent no image; its firmware was restarted"));
+}
+
 static void
 on_frame_check (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
                 GError *error)
@@ -221,6 +233,23 @@ on_frame_check (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
   guint16 pix[G5125_PIXELS];
   if (error)
     {
+      gint64 now = g_get_monotonic_time ();
+
+      /* Seen on 2026-11-09 after a suspend: the MCU answers every command and
+       * completes the TLS handshake but never sends an image, and stays that
+       * way across reboots because the sensor keeps standby power. Restarting
+       * its firmware clears it. The next attempt runs on the re-enumerated
+       * device. At most one restart per G5125_MCU_RESTART_INTERVAL. */
+      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT) &&
+          (!g5125_last_mcu_restart ||
+           now - g5125_last_mcu_restart > G5125_MCU_RESTART_INTERVAL))
+        {
+          fp_warn ("Sensor sent no image after TLS setup; restarting its firmware");
+          g_error_free (error);
+          g5125_last_mcu_restart = now;
+          goodix_send_mcu_soft_reset (dev, on_mcu_restart_sent, ssm);
+          return;
+        }
       fpi_ssm_mark_failed (ssm, error);
       return;
     }

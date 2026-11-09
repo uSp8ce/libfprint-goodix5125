@@ -403,6 +403,10 @@ void goodix_send_reset (FpDevice           *dev,
                         GoodixResetCallback callback,
                         gpointer            user_data);
 
+void goodix_send_mcu_soft_reset (FpDevice          *dev,
+                                 GoodixNoneCallback callback,
+                                 gpointer           user_data);
+
 /**
  * @brief Ask the device what firmware version it is running. Response is null-terminated string
  *

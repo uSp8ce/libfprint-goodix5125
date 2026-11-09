@@ -982,6 +982,24 @@ goodix_send_reset (FpDevice *dev, gboolean reset_sensor, guint8 sleep_time,
                         NULL);
 }
 
+/* Restarts the sensor's MCU firmware. The device drops off USB and comes back
+ * about a second later, so only the ACK is awaited. */
+void
+goodix_send_mcu_soft_reset (FpDevice *dev, GoodixNoneCallback callback,
+                            gpointer user_data)
+{
+  GoodixReset payload = {.soft_reset_mcu = TRUE,
+                         .reset_sensor = FALSE,
+                         .sleep_time = 20};
+  GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
+
+  cb_info->callback = G_CALLBACK (callback);
+  cb_info->user_data = user_data;
+  goodix_send_protocol (dev, GOODIX_CMD_RESET, (guint8 *) &payload,
+                        sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, FALSE,
+                        goodix_receive_none, cb_info);
+}
+
 void
 goodix_send_query_firmware_version (FpDevice                     *dev,
                                     GoodixFirmwareVersionCallback callback,

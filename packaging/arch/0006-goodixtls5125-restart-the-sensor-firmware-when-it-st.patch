@@ -1,0 +1,113 @@
+From cb7b01963e803d44679d2f79e5233e43ce4e51fa Mon Sep 17 00:00:00 2001
+From: uSp8ce <99090718+uSp8ce@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:41:59 +0000
+Subject: [PATCH] goodixtls5125: restart the sensor firmware when it stops
+ sending images
+
+After a suspend on 2026-11-09 the MCU acknowledged every command and
+completed the TLS handshake but never answered MCU_GET_IMAGE. The state
+survived reboots. A soft MCU reset cleared it. The activation frame check
+now sends that reset on a timeout, at most once per 30 s, and fails the
+action; the next attempt runs on the re-enumerated device.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ libfprint/drivers/goodixtls/goodix.c     | 18 +++++++++++++++
+ libfprint/drivers/goodixtls/goodix.h     |  4 ++++
+ libfprint/drivers/goodixtls/goodix5125.c | 29 ++++++++++++++++++++++++
+ 3 files changed, 51 insertions(+)
+
+diff --git a/libfprint/drivers/goodixtls/goodix.c b/libfprint/drivers/goodixtls/goodix.c
+index 8e4aa26..446cfe9 100644
+--- a/libfprint/drivers/goodixtls/goodix.c
++++ b/libfprint/drivers/goodixtls/goodix.c
+@@ -982,6 +982,24 @@ goodix_send_reset (FpDevice *dev, gboolean reset_sensor, guint8 sleep_time,
+                         NULL);
+ }
+ 
++/* Restarts the sensor's MCU firmware. The device drops off USB and comes back
++ * about a second later, so only the ACK is awaited. */
++void
++goodix_send_mcu_soft_reset (FpDevice *dev, GoodixNoneCallback callback,
++                            gpointer user_data)
++{
++  GoodixReset payload = {.soft_reset_mcu = TRUE,
++                         .reset_sensor = FALSE,
++                         .sleep_time = 20};
++  GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
++
++  cb_info->callback = G_CALLBACK (callback);
++  cb_info->user_data = user_data;
++  goodix_send_protocol (dev, GOODIX_CMD_RESET, (guint8 *) &payload,
++                        sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, FALSE,
++                        goodix_receive_none, cb_info);
++}
++
+ void
+ goodix_send_query_firmware_version (FpDevice                     *dev,
+                                     GoodixFirmwareVersionCallback callback,
+diff --git a/libfprint/drivers/goodixtls/goodix.h b/libfprint/drivers/goodixtls/goodix.h
+index d420199..93fedee 100644
+--- a/libfprint/drivers/goodixtls/goodix.h
++++ b/libfprint/drivers/goodixtls/goodix.h
+@@ -403,6 +403,10 @@ void goodix_send_reset (FpDevice           *dev,
+                         GoodixResetCallback callback,
+                         gpointer            user_data);
+ 
++void goodix_send_mcu_soft_reset (FpDevice          *dev,
++                                 GoodixNoneCallback callback,
++                                 gpointer           user_data);
++
+ /**
+  * @brief Ask the device what firmware version it is running. Response is null-terminated string
+  *
+diff --git a/libfprint/drivers/goodixtls/goodix5125.c b/libfprint/drivers/goodixtls/goodix5125.c
+index 4df0255..ff76d19 100644
+--- a/libfprint/drivers/goodixtls/goodix5125.c
++++ b/libfprint/drivers/goodixtls/goodix5125.c
+@@ -214,6 +214,18 @@ on_firmware (FpDevice *dev, gchar *firmware, gpointer ssm, GError *error)
+ 
+ /* Validate the native frame layout immediately after establishing TLS. This
+  * catches a wrong acquisition profile before accepting enrollment samples. */
++#define G5125_MCU_RESTART_INTERVAL (30 * G_USEC_PER_SEC)
++static gint64 g5125_last_mcu_restart;
++
++static void
++on_mcu_restart_sent (FpDevice *dev, gpointer ssm, GError *error)
++{
++  g_clear_error (&error);
++  fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (
++                         FP_DEVICE_ERROR_PROTO,
++                         "Sensor sent no image; its firmware was restarted"));
++}
++
+ static void
+ on_frame_check (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+                 GError *error)
+@@ -221,6 +233,23 @@ on_frame_check (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+   guint16 pix[G5125_PIXELS];
+   if (error)
+     {
++      gint64 now = g_get_monotonic_time ();
++
++      /* Seen on 2026-11-09 after a suspend: the MCU answers every command and
++       * completes the TLS handshake but never sends an image, and stays that
++       * way across reboots because the sensor keeps standby power. Restarting
++       * its firmware clears it. The next attempt runs on the re-enumerated
++       * device. At most one restart per G5125_MCU_RESTART_INTERVAL. */
++      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT) &&
++          (!g5125_last_mcu_restart ||
++           now - g5125_last_mcu_restart > G5125_MCU_RESTART_INTERVAL))
++        {
++          fp_warn ("Sensor sent no image after TLS setup; restarting its firmware");
++          g_error_free (error);
++          g5125_last_mcu_restart = now;
++          goodix_send_mcu_soft_reset (dev, on_mcu_restart_sent, ssm);
++          return;
++        }
+       fpi_ssm_mark_failed (ssm, error);
+       return;
+     }
+-- 
+2.56.0
+

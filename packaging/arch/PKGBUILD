@@ -7,7 +7,7 @@
 
 pkgname=libfprint-goodix5125
 _commit=c3bd02b6ed010903126eed623f35217e5f215958
-pkgver=1.94.100.g5125.5
+pkgver=1.94.100.g5125.6
 pkgrel=1
 pkgdesc='libfprint with the Goodix 27c6:5125 driver (matching via the Goodix engine)'
 arch=('x86_64')
@@ -25,7 +25,8 @@ source=("libfprint-goodix5125::git+https://github.com/arbnorme/libfprint-goodix5
         '0002-goodixtls5125-read-up-to-3-frames-per-touch-20-touch.patch'
         '0003-goodixtls5125-default-material-paths-under-var-lib-f.patch'
         '0004-goodixtls5125-take-the-touch-at-once-when-a-finger-i.patch'
-        '0005-goodixtls-20-ms-TLS-flight-quiet-time-instead-of-200.patch')
+        '0005-goodixtls-20-ms-TLS-flight-quiet-time-instead-of-200.patch'
+        '0006-goodixtls5125-restart-the-sensor-firmware-when-it-st.patch')
 noextract=('goodix-fp-1.1.125.20.cab')
 sha256sums=('SKIP'
             'd2d6674b6b3b17a4632a28754461db1d17bc65e7c736e14a3cf08e1a737cf11b'
@@ -33,7 +34,8 @@ sha256sums=('SKIP'
             'd35a5b97e9219efcca6606332787c772003e16848a689ea22f019be96eee9acb'
             'bb0bd38a651fbb36ec6960b359e03edd1cf66f6049b95ac4f781dd56e579ce5a'
             'b5c3552a2cbfafeda8c342efd36d1a234a63406321ddedb663c8a7c52513613f'
-            'd670cfe5fcca5774f535de844990316b99033ba79597e758217105b38f87387c')
+            'd670cfe5fcca5774f535de844990316b99033ba79597e758217105b38f87387c'
+            '5252ada8c179f8141b432f33c341ae6d3e7985eea1976f89f0aef637004a70b5')
 
 prepare() {
   cd libfprint-goodix5125
